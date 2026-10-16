@@ -18,7 +18,7 @@ Answer them with pen and paper, like a book club for one.
 - **Spoiler safe**: only text up to your current reading position is ever sent
   to Gemini.
 - **Story focused**: questions are about the book itself, its events,
-  characters, choices, and themes. Never about your personal life.
+  characters, choices, and themes.
 
 ## Setup
 
