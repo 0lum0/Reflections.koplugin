@@ -33,27 +33,24 @@ Answer them with pen and paper, like a book club for one.
 
 1. Download the latest `reflections-koplugin-vX.zip` from the releases.
 2. Unzip it. You'll get a folder called `reflections.koplugin`.
-3. Copy that folder into KOReader's `plugins` directory:
+3. **Highly recommended**: before copying anything over, open
+   `reflections.koplugin/reflections.conf.lua` in a text editor, paste your
+   API key into the `api_key` field, and save. Doing this on your computer
+   means no typing on the e-ink keyboard later.
+4. Copy that folder into KOReader's `plugins` directory:
    - **Kindle**: connect over USB, open the KOReader folder, and drop it in
      `koreader/plugins/`.
    - **Kobo / PocketBook / Android**: same idea, inside the `koreader/plugins/`
      folder wherever KOReader keeps its data.
-4. Restart KOReader (long-press the power button, or quit and relaunch).
+5. Restart KOReader (long-press the power button, or quit and relaunch).
 
-### 3. Add your API key
-
-Pick whichever is easier:
-
-- **On your computer (recommended)**: before copying the plugin over, open
-  `reflections.koplugin/reflections.conf.lua` in a text editor, paste your key
-  into the `api_key` field, and save. No typing on the e-ink keyboard.
-- **On your reader**: open any book, go to `Tools > Reflections > Settings >
-  Gemini API key`, and type it in.
-
+> Skipped step 3? You can still add your key on the reader: open any book,
+> go to `Tools > Reflections > Settings > Gemini API key`, and type it in.
+>
 > Keep your key private. Never post your `reflections.conf.lua` with a real
 > key in it.
 
-### 4. Read
+### 3. Read
 
 Open a book and read. When you finish a chapter, its questions generate
 quietly in the background. Open `Tools > Reflections` any time to browse
