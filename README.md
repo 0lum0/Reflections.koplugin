@@ -1,0 +1,105 @@
+# Reflections for KOReader
+
+A KOReader plugin that writes 1 to 3 thoughtful discussion questions for every
+chapter you finish, using the Gemini API. Answer them with pen and paper, like
+a book club for one.
+
+## What it does
+
+- **Tracks your chapters** from the book's table of contents as you read.
+- **Generates reflection prompts in the background**, silently, the moment you
+  reach a new chapter. Nothing ever appears on your reading screen.
+- **Chapter browser**: open `Tools > Reflections` to see every chapter you've
+  read so far. Tap one to read its questions; hold one to generate a fresh set.
+- **Spoiler safe**: only text up to your current reading position is ever sent
+  to Gemini.
+- **Story focused**: questions are about the book itself, its events,
+  characters, choices, and themes. Never about your personal life.
+
+## Setup
+
+### 1. Get a free Gemini API key
+
+1. Go to [Google AI Studio](https://aistudio.google.com).
+2. Sign in with a Google account.
+3. Click **Get API key** and create one in a new or existing project.
+4. Copy the key. The free tier is plenty for this plugin.
+
+### 2. Install the plugin
+
+1. Download the latest `reflections-koplugin-vX.zip` from the releases.
+2. Unzip it. You'll get a folder called `reflections.koplugin`.
+3. Copy that folder into KOReader's `plugins` directory:
+   - **Kindle**: connect over USB, open the KOReader folder, and drop it in
+     `koreader/plugins/`.
+   - **Kobo / PocketBook / Android**: same idea, inside the `koreader/plugins/`
+     folder wherever KOReader keeps its data.
+4. Restart KOReader (long-press the power button, or quit and relaunch).
+
+### 3. Add your API key
+
+Pick whichever is easier:
+
+- **On your computer (recommended)**: before copying the plugin over, open
+  `reflections.koplugin/reflections.conf.lua` in a text editor, paste your key
+  into the `api_key` field, and save. No typing on the e-ink keyboard.
+- **On your reader**: open any book, go to `Tools > Reflections > Settings >
+  Gemini API key`, and type it in.
+
+> Keep your key private. Never post your `reflections.conf.lua` with a real
+> key in it.
+
+### 4. Read
+
+Open a book and read. When you finish a chapter, its questions generate
+quietly in the background. Open `Tools > Reflections` any time to browse
+chapters and read their prompts. Generation usually takes 10 to 30 seconds on
+decent Wi-Fi.
+
+## Settings
+
+Inside `Tools > Reflections > Settings`:
+
+| Setting | What it does | Default |
+|---|---|---|
+| Gemini API key | Your key from Google AI Studio | (empty) |
+| Prompts per chapter | 1, 2, or 3 questions per chapter | 3 |
+| Model | Any Gemini model id you want to use | `gemini-3.5-flash-lite` |
+| Generate in background | Make questions automatically as you read | on |
+
+**About the model**: the plugin uses `gemini-3.5-flash-lite` out of the box.
+It's fast, cheap, and more than capable of writing good discussion questions.
+If Google ever reports it overloaded, the plugin automatically retries and then
+falls back to `gemini-3.5-flash`. You can switch to any other Gemini model id
+in Settings and it will be tried first.
+
+**Clearing saved questions**: the chapter list has a *Clear cached prompts*
+entry (with a confirmation step) that wipes every saved question for the
+current book. Holding a single chapter regenerates just that chapter.
+
+## How it works
+
+- Chapter boundaries come from the book's own table of contents, matched
+  against your current page.
+- Only chapter text up to where you're reading is sent to Gemini, so later
+  chapters can't leak in.
+- Questions are cached per book, so reopening a chapter is instant and costs
+  nothing.
+- Background generation runs in a separate process and never touches the
+  reading UI.
+
+## Requirements
+
+- KOReader (any recent version)
+- A Gemini API key (free tier works)
+- Wi-Fi when questions are being generated
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+---
+
+Chapter tracking approach adapted from
+[xray.koplugin](https://github.com/ultimatejimmy/xray.koplugin). Everything
+else is original.
