@@ -127,7 +127,8 @@ function Chapters.getBookInfo(ui)
 end
 
 -- Extract chapter text, never including content past the reader's position.
-function Chapters.getChapterText(ui, chapter, next_chapter, which)
+-- budget caps the returned bytes (default 12000).
+function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
     local text = ""
     local is_reflowable = ui.rolling ~= nil
     local current_page = Chapters.getCurrentPage(ui)
@@ -182,7 +183,41 @@ function Chapters.getChapterText(ui, chapter, next_chapter, which)
     text = text:gsub("[ \t]+", " ")
     text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
     text = text:gsub("^%s+", ""):gsub("%s+$", "")
-    return fitBudget(text, 12000)
+    return fitBudget(text, budget or 12000)
+end
+
+-- Index of the chapter with this title in the flattened chapter list.
+function Chapters.findIndexByTitle(ui, title)
+    local list = Chapters.getChapterList(ui)
+    for i, node in ipairs(list) do
+        if node.title == title then return i end
+    end
+    return nil
+end
+
+-- Spoiler-safe text for a chapter range (a reading session): concatenates
+-- each chapter's text under a chapter header. Only finished chapters should
+-- be included; callers enforce that. per_chapter_budget caps each chapter's
+-- contribution (default 8000), total capped at 30000.
+function Chapters.getRangeText(ui, from_idx, to_idx, per_chapter_budget)
+    per_chapter_budget = per_chapter_budget or 8000
+    local flat = Chapters.getChapterList(ui)
+    if #flat == 0 then return "" end
+    from_idx = math.max(1, from_idx or 1)
+    to_idx = math.min(#flat, to_idx or #flat)
+    if from_idx > to_idx then return "" end
+    local parts = {}
+    for i = from_idx, to_idx do
+        local node = flat[i]
+        local ok, text = pcall(Chapters.getChapterText, ui, node, flat[i + 1],
+            "previous", per_chapter_budget)
+        if ok and text and #text >= 50 then
+            table.insert(parts, "--- Chapter: "
+                .. tostring(node.title or ("#" .. i)) .. " ---\n" .. text)
+        end
+    end
+    if #parts == 0 then return "" end
+    return fitBudget(table.concat(parts, "\n\n"), 30000)
 end
 
 return Chapters

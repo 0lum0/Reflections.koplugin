@@ -15,8 +15,11 @@ return {
     -- Model to use (default shown).
     model = "gemini-3.5-flash-lite",
 
-    -- Reflection prompts per chapter: 1, 2 or 3.
+    -- Reflection prompts per chapter: 1 to 20.
     prompt_count = 3,
+
+    -- Reflection prompts per reading session: 1 to 20.
+    session_prompt_count = 6,
 
     -- Generate prompts silently in the background when you finish a chapter.
     background = true,

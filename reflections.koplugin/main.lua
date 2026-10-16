@@ -20,6 +20,8 @@ local RETIRED_MODELS = {
     ["gemini-2.5-flash"] = true,
 }
 local DEFAULT_PROMPT_COUNT = 3
+local DEFAULT_SESSION_PROMPT_COUNT = 6
+local MAX_PROMPT_COUNT = 20
 
 -- fork()/waitpid() for silent background generation (no UI, ever).
 local ffi_ok, ffi = pcall(require, "ffi")
@@ -90,7 +92,18 @@ function Reflections:getPromptCount()
     end
     if n == nil then n = self:getFileConfig().prompt_count end
     n = tonumber(n) or DEFAULT_PROMPT_COUNT
-    if n < 1 or n > 3 then n = DEFAULT_PROMPT_COUNT end
+    if n < 1 or n > MAX_PROMPT_COUNT then n = DEFAULT_PROMPT_COUNT end
+    return n
+end
+
+function Reflections:getSessionPromptCount()
+    local n
+    if G_reader_settings then
+        n = G_reader_settings:readSetting("reflections_session_prompt_count")
+    end
+    if n == nil then n = self:getFileConfig().session_prompt_count end
+    n = tonumber(n) or DEFAULT_SESSION_PROMPT_COUNT
+    if n < 1 or n > MAX_PROMPT_COUNT then n = DEFAULT_SESSION_PROMPT_COUNT end
     return n
 end
 
@@ -195,7 +208,50 @@ function Reflections:editModel()
     dialog:onShowKeyboard()
 end
 
--- ------------------------------------------------------- per-book storage
+-- Number input for a prompt-count setting. kind is "chapter" or "session".
+-- on_done, if given, runs after the dialog closes (e.g. to refresh a menu).
+function Reflections:editPromptCount(kind, on_done)
+    local is_session = kind == "session"
+    local setting = is_session and "reflections_session_prompt_count"
+        or "reflections_prompt_count"
+    local current = is_session and self:getSessionPromptCount()
+        or self:getPromptCount()
+    local title = is_session and _("Questions per session")
+        or _("Prompts per chapter")
+    local dialog
+    dialog = InputDialog:new{
+        title = title,
+        input_hint = _("1 to 20"),
+        input = tostring(current),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        if on_done then on_done() end
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    callback = function()
+                        local v = tonumber(dialog:getInputText())
+                        if v then
+                            v = math.floor(v)
+                            if v >= 1 and v <= MAX_PROMPT_COUNT then
+                                G_reader_settings:saveSetting(setting, v)
+                            end
+                        end
+                        UIManager:close(dialog)
+                        if on_done then on_done() end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
 
 function Reflections:getDocStore()
     local ok, ds = pcall(function() return self.ui.doc_settings end)
@@ -372,6 +428,123 @@ function Reflections:buildPrompt(title, author, chapter_title, text, n)
         .. "- Output ONLY the numbered questions, nothing else"
 end
 
+-- Prompt for a reading session: several chapters read in one sitting.
+-- Asks for questions about connections ACROSS the chapters.
+
+-- Ten nuanced angles for session questions. Each lens question takes one,
+-- picked at random.
+local SESSION_LENSES = {
+    "plot and events",
+    "characters and their choices",
+    "themes and ideas",
+    "shifting relationships between characters",
+    "foreshadowing and payoff",
+    "the author's craft and structure",
+    "moral gray areas",
+    "worldbuilding and setting",
+    "the emotional arc across the chapters",
+    "predictions about what comes next",
+}
+
+local random_seeded, seed_counter = false, 0
+local function ensureSeeded()
+    if random_seeded then return end
+    seed_counter = seed_counter + 1
+    math.randomseed(os.time() * 1000 + math.floor(os.clock() * 1000)
+        + seed_counter * 7919)
+    math.random()
+    random_seeded = true
+end
+
+-- Pick k lenses in random order, reshuffling the pool when exhausted so
+-- repeats are spaced out.
+local function pickLenses(k)
+    ensureSeeded()
+    local picked, pool = {}, {}
+    local function refill()
+        pool = {}
+        for i, lens in ipairs(SESSION_LENSES) do pool[i] = lens end
+        for i = #pool, 2, -1 do
+            local j = math.random(i)
+            pool[i], pool[j] = pool[j], pool[i]
+        end
+    end
+    refill()
+    while #picked < k do
+        if #pool == 0 then refill() end
+        table.insert(picked, table.remove(pool))
+    end
+    return picked
+end
+
+-- Plan a session's questions. The first 3 are always organic cross-chapter
+-- questions (lenses only appear when n > 3). Beyond those, each question
+-- takes one random lens. At 7+ questions there's a small chance one lens is
+-- swapped for a playful question, so it stays a rare surprise.
+-- Returns organic_n, {lens, ...}, playful.
+local PLAYFUL_CHANCE = 0.35
+
+local function sessionPlan(n)
+    if n <= 3 then return n, {}, false end
+    local lenses = pickLenses(n - 3)
+    if n >= 7 and math.random() < PLAYFUL_CHANCE then
+        table.remove(lenses, math.random(#lenses))
+        return 3, lenses, true
+    end
+    return 3, lenses, false
+end
+
+function Reflections:buildSessionPrompt(title, author, from_title, to_title, text, n)
+    local organic_n, lenses, playful = sessionPlan(n)
+
+    local function qword(c, one, many)
+        if c == 1 then return "1 " .. one end
+        return c .. " " .. many
+    end
+
+    local steps = {}
+    table.insert(steps, "first write "
+        .. qword(organic_n, "open-ended question", "open-ended questions")
+        .. " about connections ACROSS the chapters: how characters change, "
+        .. "how themes develop, how an event in one chapter reframes another")
+
+    if #lenses > 0 then
+        local bits = {}
+        for _, lens in ipairs(lenses) do
+            table.insert(bits, "1 question about " .. lens)
+        end
+        table.insert(steps, "then write " .. table.concat(bits, ", "))
+    end
+
+    if playful then
+        table.insert(steps, "finally write 1 playful, creative question: "
+            .. "for example, asking for a better title for one of the "
+            .. "chapters, casting choices for a movie version of a scene, or "
+            .. "a one-sentence dramatic summary of the session")
+    end
+
+    return "You are a reading companion helping someone think deeply about "
+        .. "the story they just read. They read several chapters in one sitting "
+        .. "and will answer with pen and paper in a physical journal, so make "
+        .. "each question open-ended and worth writing about.\n\n"
+        .. "Book: \"" .. title .. "\" by " .. author .. "\n"
+        .. "Chapters read this session: \"" .. from_title .. "\" through \""
+        .. to_title .. "\"\n\n"
+        .. "Chapter texts (may be excerpted; NEVER reference anything beyond "
+        .. "this text):\n---\n" .. text .. "\n---\n\n"
+        .. "Write exactly " .. tostring(n) .. " numbered discussion questions "
+        .. "about THESE chapters as a group, the kind a thoughtful book club "
+        .. "would ask, in this order: " .. table.concat(steps, "; ")
+        .. ". Rules:\n"
+        .. "- About the story itself: its events, characters, choices, themes, and ideas\n"
+        .. "- Open-ended: no yes/no questions, no single correct answer\n"
+        .. "- Never ask about the reader's own life, feelings, or experiences\n"
+        .. "- Never ask what the reader would do in a character's situation\n"
+        .. "- Do not summarize the chapters\n"
+        .. "- Do not reveal or hint at anything not in the text above\n"
+        .. "- Output ONLY the numbered questions, nothing else"
+end
+
 -- A short stable key for this book, used to name background result files.
 function Reflections:getBookKey()
     local key
@@ -391,26 +564,23 @@ end
 -- retries for transient errors) and writes the result to a temp file.
 -- opts: { kind = "previous"|"current", partial = bool, overwrite = bool }.
 -- Returns true when a job is now running (or already was).
-function Reflections:launchGeneration(chapter_title, node, next_node, opts)
+-- Forks a child that runs only the HTTPS call (with retries for transient
+-- errors) and writes the result to a temp file, which the parent picks up
+-- later. key identifies the job: a chapter title or a session key.
+-- Returns true when a job is now running (or already was).
+function Reflections:spawnJob(key, prompt_text, opts)
     opts = opts or {}
-    if self._inflight[chapter_title] then return true end
-    local kind = opts.kind or "previous"
-    local ok, text = pcall(Chapters.getChapterText, self.ui, node, next_node, kind)
-    if not ok or not text or #text < 50 then return false end
-    local info = Chapters.getBookInfo(self.ui)
-    local prompt_text = self:buildPrompt(
-        info.title, info.author, chapter_title, text, self:getPromptCount())
-
+    if self._inflight[key] then return true end
     self._job_seq = self._job_seq + 1
     local result_path = string.format("/tmp/reflections_%s_%d_%d_%d.txt",
         self:getBookKey(), os.time(), self._job_seq, math.random(1000000))
-    self._inflight[chapter_title] = {
+    self._inflight[key] = {
         path = result_path,
         started = os.time(),
         partial = opts.partial and true or false,
         overwrite = opts.overwrite and true or false,
     }
-    self._job_errors[chapter_title] = nil
+    self._job_errors[key] = nil
 
     local api_key, models = self:getApiKey(), self:getModelChain()
     local pid = ffi.C.fork()
@@ -420,19 +590,31 @@ function Reflections:launchGeneration(chapter_title, node, next_node, opts)
         local f = io.open(result_path, "w")
         if f then
             if okc and result then
-                f:write("OK\n" .. chapter_title .. "\n" .. result)
+                f:write("OK\n" .. key .. "\n" .. result)
             else
-                f:write("ERR\n" .. chapter_title .. "\n" .. tostring(result))
+                f:write("ERR\n" .. key .. "\n" .. tostring(result))
             end
             f:close()
         end
         ffi.C._exit(0)
     elseif pid > 0 then
-        self._inflight[chapter_title].pid = pid
+        self._inflight[key].pid = pid
     else
-        self._inflight[chapter_title] = nil -- fork failed
+        self._inflight[key] = nil -- fork failed
     end
     return true
+end
+
+function Reflections:launchGeneration(chapter_title, node, next_node, opts)
+    opts = opts or {}
+    if self._inflight[chapter_title] then return true end
+    local kind = opts.kind or "previous"
+    local ok, text = pcall(Chapters.getChapterText, self.ui, node, next_node, kind)
+    if not ok or not text or #text < 50 then return false end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt_text = self:buildPrompt(
+        info.title, info.author, chapter_title, text, self:getPromptCount())
+    return self:spawnJob(chapter_title, prompt_text, opts)
 end
 
 -- Kick off a SILENT background generation for a just-finished chapter.
@@ -619,6 +801,274 @@ function Reflections:generateForChapterSync(chapter_title, node, next_node, kind
     self:showPrompts(chapter_title, result, false)
 end
 
+-- ---------------------------------------------------------- session mode
+
+-- A reading session is a user-picked range of finished chapters, e.g.
+-- everything read tonight. Questions span the range: character arcs,
+-- developing themes, one chapter reframing another.
+
+function Reflections:getSessionKey(from_title, to_title)
+    return from_title .. " → " .. to_title
+end
+
+-- Last-picked session bounds for this book; default to everything read.
+function Reflections:getSessionBound(which)
+    local b = self:readDocSetting("reflections_session")
+    if type(b) == "table" and b[which] then return b[which] end
+    local progress = self:getProgress()
+    if #progress == 0 then return nil end
+    if which == "from" then return progress[1].title end
+    return progress[#progress].title
+end
+
+function Reflections:setSessionBound(which, title)
+    local b = self:readDocSetting("reflections_session")
+    if type(b) ~= "table" then b = {} end
+    b[which] = title
+    self:saveDocSetting("reflections_session", b)
+end
+
+function Reflections:getPastSessions()
+    local s = self:readDocSetting("reflections_sessions")
+    if type(s) ~= "table" then return {} end
+    return s
+end
+
+function Reflections:recordSession(key, from_title, to_title)
+    local sessions = {}
+    for _, s in ipairs(self:getPastSessions()) do
+        if s.key ~= key then table.insert(sessions, s) end
+    end
+    table.insert(sessions, 1, { key = key, from = from_title, to = to_title })
+    while #sessions > 10 do table.remove(sessions) end
+    self:saveDocSetting("reflections_sessions", sessions)
+end
+
+-- Range picker: choose the first and last chapter of the session from the
+-- finished chapters, then generate. Past sessions are listed for re-reading.
+function Reflections:showSessionPicker()
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local progress = self:getProgress()
+    if #progress == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No finished chapters yet. Read a little first, then come back."),
+        })
+        return
+    end
+    local Menu = require("ui/widget/menu")
+    local menu
+    local function chapterChoices(which)
+        local t = {}
+        for _, e in ipairs(progress) do
+            local title = e.title
+            table.insert(t, {
+                text = title,
+                callback = function()
+                    UIManager:close(menu)
+                    self:setSessionBound(which, title)
+                    self:showSessionPicker()
+                end,
+            })
+        end
+        return t
+    end
+    local items = {
+        {
+            text = _("Generate session questions"),
+            callback = function()
+                UIManager:close(menu)
+                self:generateForSession(self:getSessionBound("from"),
+                    self:getSessionBound("to"), false)
+            end,
+        },
+        {
+            text_func = function()
+                return _("From: ") .. tostring(self:getSessionBound("from"))
+            end,
+            sub_item_table = chapterChoices("from"),
+        },
+        {
+            text_func = function()
+                return _("To: ") .. tostring(self:getSessionBound("to"))
+            end,
+            sub_item_table = chapterChoices("to"),
+        },
+        {
+            text_func = function()
+                return _("Questions: ")
+                    .. tostring(self:getSessionPromptCount())
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:editPromptCount("session", function()
+                    self:showSessionPicker()
+                end)
+            end,
+        },
+    }
+    for _, s in ipairs(self:getPastSessions()) do
+        local sess = s
+        table.insert(items, {
+            text = sess.key,
+            callback = function()
+                UIManager:close(menu)
+                local cached = self:readCachedPrompts(sess.key)
+                if cached then
+                    self:showSessionPrompts(sess.key, sess.from, sess.to, cached,
+                        { from_cache = true })
+                else
+                    self:generateForSession(sess.from, sess.to, false)
+                end
+            end,
+        })
+    end
+    table.insert(items, {
+        text = _("Close"),
+        callback = function() UIManager:close(menu) end,
+    })
+    menu = Menu:new{
+        title = _("Session questions"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
+-- Generate (or show cached) questions for a chapter range. Never blocks the
+-- UI: the prompts page opens immediately with a placeholder and fills in
+-- when the forked job's result lands.
+function Reflections:generateForSession(from_title, to_title, force)
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    from_title = from_title or self:getSessionBound("from")
+    to_title = to_title or self:getSessionBound("to")
+    local from_idx = from_title and Chapters.findIndexByTitle(self.ui, from_title)
+    local to_idx = to_title and Chapters.findIndexByTitle(self.ui, to_title)
+    if not from_idx or not to_idx then
+        UIManager:show(InfoMessage:new{
+            text = _("Could not find those chapters in this book."),
+        })
+        return
+    end
+    if from_idx > to_idx then -- picked backwards: swap rather than complain
+        from_idx, to_idx = to_idx, from_idx
+        from_title, to_title = to_title, from_title
+    end
+    local key = self:getSessionKey(from_title, to_title)
+    local regen = function()
+        self:generateForSession(from_title, to_title, true)
+    end
+    if not force then
+        local cached = self:readCachedPrompts(key)
+        if cached then
+            self:showSessionPrompts(key, from_title, to_title, cached,
+                { from_cache = true, regen = regen })
+            return
+        end
+    end
+
+    -- No fork support (never happens on real devices): synchronous fallback.
+    if not ffi_ok then
+        self:generateForSessionSync(key, from_title, to_title,
+            from_idx, to_idx, regen)
+        return
+    end
+
+    -- Regenerating while a job is already running: stop the old one first.
+    if force then
+        local old_job = self._inflight[key]
+        if old_job then
+            pcall(function()
+                if old_job.pid then
+                    ffi.C.kill(old_job.pid, SIGKILL)
+                    ffi.C.waitpid(old_job.pid, nil, 0)
+                end
+            end)
+            pcall(os.remove, old_job.path)
+            self._inflight[key] = nil
+        end
+    end
+
+    self:showSessionPrompts(key, from_title, to_title,
+        _("Generating your prompts…"), { placeholder = true, regen = regen })
+    self._pending = {
+        title = key,
+        old = self:readCachedPrompts(key),
+        waited = 0,
+        session = true,
+        regen = regen,
+    }
+    local ok, text = pcall(Chapters.getRangeText, self.ui, from_idx, to_idx)
+    if not ok or not text or #text < 50 then
+        self._pending = nil
+        self:showSessionPrompts(key, from_title, to_title,
+            _("Could not extract enough chapter text."), { regen = regen })
+        return
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt_text = self:buildSessionPrompt(info.title, info.author,
+        from_title, to_title, text, self:getSessionPromptCount())
+    self:spawnJob(key, prompt_text, { overwrite = force })
+    self:recordSession(key, from_title, to_title)
+    self:pollPendingPrompts()
+end
+
+-- Synchronous fallback used only when fork() is unavailable.
+function Reflections:generateForSessionSync(key, from_title, to_title,
+    from_idx, to_idx, regen)
+    local busy = InfoMessage:new{ text = _("Generating reflection prompts...") }
+    UIManager:show(busy)
+    UIManager:forceRePaint()
+
+    local text = Chapters.getRangeText(self.ui, from_idx, to_idx)
+    if not text or #text < 50 then
+        UIManager:close(busy)
+        UIManager:show(InfoMessage:new{
+            text = _("Could not extract enough chapter text."),
+        })
+        return
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildSessionPrompt(info.title, info.author,
+        from_title, to_title, text, self:getSessionPromptCount())
+    local result, err = Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+    UIManager:close(busy)
+
+    if not result then
+        UIManager:show(InfoMessage:new{
+            text = _("Gemini request failed:\n") .. tostring(err),
+        })
+        return
+    end
+    self:cachePrompts(key, result, false)
+    self:recordSession(key, from_title, to_title)
+    self:showSessionPrompts(key, from_title, to_title, result,
+        { from_cache = false, regen = regen })
+end
+
+-- Prompts page for a session. Thin wrapper: the key doubles as the page
+-- title, and New prompts regenerates this exact range.
+function Reflections:showSessionPrompts(key, from_title, to_title, prompts, opt)
+    if type(opt) ~= "table" then opt = { from_cache = opt } end
+    if not opt.regen then
+        opt.regen = function()
+            self:generateForSession(from_title, to_title, true)
+        end
+    end
+    self:showPrompts(key, prompts, opt)
+end
+
 -- Watches the forked job started by generateForChapter and swaps the
 -- placeholder page for the real prompts (or a readable error) when it
 -- lands. The UI stays responsive the whole time; pressing Back cancels
@@ -629,26 +1079,31 @@ function Reflections:pollPendingPrompts()
     UIManager:scheduleIn(2, function()
         if self._pending ~= my then return end -- superseded or cancelled
         pcall(function() self:reapBackgroundJobs() end)
+        -- Sessions render through the same prompts page; their New prompts
+        -- button regenerates the range via the stored regen callback.
+        local function showIt(prompts, opt)
+            opt = opt or {}
+            if my.session and my.regen then opt.regen = my.regen end
+            self:showPrompts(my.title, prompts, opt)
+        end
         local prompts = self:readCachedPrompts(my.title)
         local job_done = self._inflight[my.title] == nil
         if prompts and (prompts ~= my.old or job_done) then
             self._pending = nil
-            self:showPrompts(my.title, prompts, { from_cache = false })
+            showIt(prompts, { from_cache = false })
             return
         end
         local err = self._job_errors[my.title]
         if err then
             self._pending = nil
             self._job_errors[my.title] = nil
-            self:showPrompts(my.title,
-                _("Gemini request failed: ") .. tostring(err), {})
+            showIt(_("Gemini request failed: ") .. tostring(err), {})
             return
         end
         my.waited = my.waited + 2
         if my.waited >= 330 then
             self._pending = nil
-            self:showPrompts(my.title,
-                _("Gemini is taking too long. Check your connection and try again."), {})
+            showIt(_("Gemini is taking too long. Check your connection and try again."), {})
             return
         end
         self:pollPendingPrompts()
@@ -775,7 +1230,11 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
                 Button:new{
                     text = _("New prompts"),
                     callback = function()
-                        self:generateForChapter(chapter_title, true)
+                        if type(opt) == "table" and opt.regen then
+                            opt.regen()
+                        else
+                            self:generateForChapter(chapter_title, true)
+                        end
                     end,
                 },
                 HorizontalSpan:new{ width = pad },
@@ -829,6 +1288,13 @@ function Reflections:showMainScreen()
         end,
     })
     table.insert(items, {
+        text = _("Session questions…"),
+        callback = function()
+            UIManager:close(menu)
+            self:showSessionPicker()
+        end,
+    })
+    table.insert(items, {
         text = _("Settings"),
         sub_item_table = {
             {
@@ -845,11 +1311,7 @@ function Reflections:showMainScreen()
                     return _("Prompts per chapter: ")
                         .. tostring(self:getPromptCount())
                 end,
-                callback = function()
-                    local n = self:getPromptCount()
-                    n = (n % 3) + 1
-                    G_reader_settings:saveSetting("reflections_prompt_count", n)
-                end,
+                callback = function() self:editPromptCount("chapter") end,
             },
             {
                 text_func = function()

@@ -11,6 +11,10 @@ a book club for one.
   reach a new chapter. Nothing ever appears on your reading screen.
 - **Chapter browser**: open `Tools > Reflections` to see every chapter you've
   read so far. Tap one to read its questions; hold one to generate a fresh set.
+- **Session questions**: read several chapters in one sitting? Pick the first
+  and last chapter and get questions about the whole range, focused on how
+  characters change and themes develop across chapters. Past sessions are
+  remembered for re-reading.
 - **Spoiler safe**: only text up to your current reading position is ever sent
   to Gemini.
 - **Story focused**: questions are about the book itself, its events,
@@ -63,7 +67,8 @@ Inside `Tools > Reflections > Settings`:
 | Setting | What it does | Default |
 |---|---|---|
 | Gemini API key | Your key from Google AI Studio | (empty) |
-| Prompts per chapter | 1, 2, or 3 questions per chapter | 3 |
+| Prompts per chapter | 1 to 20 questions per chapter (tap to type a number) | 3 |
+| Questions per session | 1 to 20 questions per session, set inside the session picker | 6 |
 | Model | Any Gemini model id you want to use | `gemini-3.5-flash-lite` |
 | Generate in background | Make questions automatically as you read | on |
 
@@ -76,6 +81,14 @@ in Settings and it will be tried first.
 **Clearing saved questions**: the chapter list has a *Clear cached prompts*
 entry (with a confirmation step) that wipes every saved question for the
 current book. Holding a single chapter regenerates just that chapter.
+
+**How session questions are built**: the first 3 are always open-ended
+cross-chapter questions. Past 3, each question takes one random lens from ten
+angles: plot and events, characters and their choices, themes and ideas,
+shifting relationships, foreshadowing and payoff, the author's craft, moral
+gray areas, worldbuilding, the emotional arc, and predictions. At 7+
+questions there's a small chance one lens becomes a playful question instead,
+so it stays a rare surprise.
 
 ## How it works
 
