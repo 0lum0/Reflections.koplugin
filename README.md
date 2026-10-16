@@ -1,8 +1,8 @@
 # Reflections for KOReader
 
-A KOReader plugin that writes 1 to 3 thoughtful discussion questions for every
-chapter you finish, using the Gemini API. Answer them with pen and paper, like
-a book club for one.
+A KOReader plugin that writes thoughtful discussion questions for every
+chapter you finish, and for whole reading sessions, using the Gemini API.
+Answer them with pen and paper, like a book club for one.
 
 ## What it does
 
