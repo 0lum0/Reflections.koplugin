@@ -74,9 +74,6 @@ Inside `Tools > Reflections > Settings`:
 
 **About the model**: the plugin uses `gemini-3.5-flash-lite` out of the box.
 It's fast, cheap, and more than capable of writing good discussion questions.
-If Google ever reports it overloaded, the plugin automatically retries and then
-falls back to `gemini-3.5-flash`. You can switch to any other Gemini model id
-in Settings and it will be tried first.
 
 **Clearing saved questions**: the chapter list has a *Clear cached prompts*
 entry (with a confirmation step) that wipes every saved question for the
