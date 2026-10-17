@@ -54,6 +54,9 @@ Answer them with pen and paper, like a book club for one.
 > Skipped step 3? You can still add your key on the reader: open any book,
 > go to `Tools > Reflections > Settings > Gemini API key`, and type it in.
 >
+> Once the plugin has seen your key, it stores it in KOReader's own settings,
+> so updating the plugin later never wipes it. One and done.
+>
 > Keep your key private. Never post your `reflections.conf.lua` with a real
 > key in it.
 

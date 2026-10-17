@@ -50,9 +50,33 @@ function Reflections:init()
     self._job_errors = {}   -- chapter title -> last background/foreground job error
     self._pending = nil     -- foreground tap currently waiting on a job
     self._open_prompts = nil -- currently shown prompts page, if any
+    self:migrateFileConfig()
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
     end
+end
+
+-- The plugin folder (including reflections.conf.lua) is replaced wholesale
+-- when the plugin is updated, so the conf file is only ever a seed: copy
+-- any preconfigured values into KOReader's own settings the first time they
+-- are seen. Only fills in settings the device does not already have, so
+-- on-device Settings always win, and a later update can never wipe them.
+function Reflections:migrateFileConfig()
+    if not G_reader_settings then return end
+    local cfg = self:getFileConfig()
+    local function seed(setting, value)
+        if value == nil or value == "" then return end
+        local cur = G_reader_settings:readSetting(setting)
+        if cur == nil or cur == "" then
+            G_reader_settings:saveSetting(setting, value)
+        end
+    end
+    seed("reflections_gemini_key", cfg.api_key)
+    seed("reflections_prompt_count", tonumber(cfg.prompt_count))
+    seed("reflections_session_prompt_count", tonumber(cfg.session_prompt_count))
+    seed("reflections_book_prompt_count", tonumber(cfg.book_prompt_count))
+    seed("reflections_model", cfg.model)
+    seed("reflections_background", cfg.background)
 end
 
 -- ---------------------------------------------------------------- settings
