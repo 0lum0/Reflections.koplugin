@@ -47,16 +47,33 @@ function Gemini._request(api_key, model, prompt_text, timeout)
         ["x-goog-api-key"] = api_key,
     }
 
-    local ok_https, https = pcall(require, "ssl.https")
-    if not ok_https or not https then
-        return nil, "HTTPS support is not available on this device"
-    end
-    -- Some e-ink devices lack current CA bundles; keep requests working.
-    pcall(function() https.cert_verify = false end)
-
     local ltn12 = require("ltn12")
     local socketutil = require("socketutil")
     pcall(function() socketutil:set_timeout(timeout, timeout) end)
+
+    -- Transports to try in order. socket.http first: on current KOReader
+    -- builds it handles https URLs (this is also what xray.koplugin uses,
+    -- and it works on devices where ssl.https currently throws with no
+    -- message). ssl.https stays as fallback for builds where that flips.
+    local transports = {}
+    local ok_http, http = pcall(require, "socket.http")
+    if ok_http and http and http.request then
+        transports[#transports + 1] = { name = "socket.http", fn = http.request }
+    end
+    local ok_https, https = pcall(require, "ssl.https")
+    if ok_https and https and https.request then
+        -- Some e-ink devices lack current CA bundles; keep requests working.
+        pcall(function() https.cert_verify = false end)
+        transports[#transports + 1] = { name = "ssl.https", fn = https.request }
+    end
+    if #transports == 0 then
+        return nil, "HTTPS support is not available on this device"
+    end
+
+    local function new_sink(t)
+        if socketutil.table_sink then return socketutil.table_sink(t) end
+        return ltn12.sink.table(t)
+    end
 
     local response_body = {}
     local request = {
@@ -64,22 +81,38 @@ function Gemini._request(api_key, model, prompt_text, timeout)
         method = "POST",
         headers = headers,
         source = ltn12.source.string(body),
-        sink = ltn12.sink.table(response_body),
+        sink = new_sink(response_body),
     }
 
-    local ok, code
-    local pok, perr = pcall(function()
-        ok, code = https.request(request)
-    end)
+    local ok, code, fail_detail
+    for _, t in ipairs(transports) do
+        response_body = {}
+        request.sink = new_sink(response_body)
+        local ok2, a, b = xpcall(function() return t.fn(request) end,
+            function(e) return e end)
+        if ok2 and a then
+            ok, code = a, b
+            fail_detail = nil
+            break
+        end
+        -- This transport threw (a messageless crash on some devices) or
+        -- returned a failure: name it and try the next one.
+        fail_detail = t.name .. (ok2 and (" failed: " .. tostring(b))
+            or " crashed with no error message")
+        ok, code = nil, nil
+    end
     pcall(function() socketutil:reset_timeout() end)
-    if not pok then
-        -- Network-level failure (DNS, refused, dropped): no HTTP code.
-        return nil, "request failed: " .. tostring(perr)
+    if not ok then
+        -- Every transport failed: no usable HTTP code.
+        return nil, "request failed: " .. tostring(fail_detail)
     end
 
     local response_text = table.concat(response_body)
     code = tonumber(code) or 0
     if not ok or code < 200 or code >= 300 then
+        if code == 401 then
+            return nil, "Gemini rejected the API key. Check it in Tools > Reflections > Settings > Gemini API key.", code
+        end
         local detail = response_text:sub(1, 300)
         if detail == "" then detail = "no response body" end
         return nil, "HTTP " .. tostring(code) .. ": " .. detail, code

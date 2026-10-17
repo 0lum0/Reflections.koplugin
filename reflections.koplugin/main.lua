@@ -77,6 +77,18 @@ function Reflections:migrateFileConfig()
     seed("reflections_book_prompt_count", tonumber(cfg.book_prompt_count))
     seed("reflections_model", cfg.model)
     seed("reflections_background", cfg.background)
+    -- The API key gets one more rule: if the conf key changed since we last
+    -- saw it, the user edited it on their computer and expects it to take
+    -- effect, so it overwrites the device key. A blank conf (e.g. right
+    -- after a storefront update) never wipes the device key.
+    local conf_key = cfg.api_key
+    if type(conf_key) == "string" and conf_key ~= "" then
+        local seen = G_reader_settings:readSetting("reflections_conf_key_seen")
+        if seen ~= conf_key then
+            G_reader_settings:saveSetting("reflections_gemini_key", conf_key)
+            G_reader_settings:saveSetting("reflections_conf_key_seen", conf_key)
+        end
+    end
 end
 
 -- ---------------------------------------------------------------- settings
@@ -105,11 +117,16 @@ function Reflections:getFileConfig()
 end
 
 function Reflections:getApiKey()
+    local v
     if G_reader_settings then
-        local v = G_reader_settings:readSetting("reflections_gemini_key")
-        if v and v ~= "" then return v end
+        v = G_reader_settings:readSetting("reflections_gemini_key")
     end
-    return self:getFileConfig().api_key or ""
+    if not v or v == "" then
+        v = self:getFileConfig().api_key
+    end
+    if type(v) ~= "string" then return "" end
+    -- E-ink keyboards love stray spaces: never send them to Google.
+    return v:gsub("^%s+", ""):gsub("%s+$", "")
 end
 
 function Reflections:getPromptCount()
@@ -750,13 +767,16 @@ function Reflections:spawnJob(key, prompt_text, opts)
     local pid = ffi.C.fork()
     if pid == 0 then
         -- Child: network only. Never touch UI, the document, or plugin state.
-        local okc, result = pcall(Gemini.generate, api_key, models, prompt_text, 45, 1)
+        -- pcall yields generate()'s (text) or (nil, err): keep the error,
+        -- or every failure surfaces as a bare "nil".
+        local okc, result, errmsg =
+            pcall(Gemini.generate, api_key, models, prompt_text, 45, 1)
         local f = io.open(result_path, "w")
         if f then
             if okc and result then
                 f:write("OK\n" .. key .. "\n" .. result)
             else
-                f:write("ERR\n" .. key .. "\n" .. tostring(result))
+                f:write("ERR\n" .. key .. "\n" .. tostring(errmsg or result))
             end
             f:close()
         end
@@ -1741,8 +1761,12 @@ function Reflections:showMainScreen()
         sub_item_table = {
             {
                 text_func = function()
-                    if self:getApiKey() ~= "" then
-                        return _("Gemini API key: set")
+                    local k = self:getApiKey()
+                    if k ~= "" then
+                        -- Fingerprint, not the key: enough to spot a typo.
+                        local fp = k:sub(1, 6) .. "..." .. k:sub(-4)
+                            .. " (" .. #k .. " chars)"
+                        return _("Gemini API key: set [") .. fp .. "]"
                     end
                     return _("Gemini API key: missing")
                 end,
