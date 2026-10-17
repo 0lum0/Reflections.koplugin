@@ -15,6 +15,13 @@ Answer them with pen and paper, like a book club for one.
   and last chapter and get questions about the whole range, focused on how
   characters change and themes develop across chapters. Past sessions are
   remembered for re-reading.
+- **End of book reflection**: finished the book? Get one set of big-picture
+  questions about the whole work: how characters changed from beginning to
+  end, what it's ultimately about, what lingers after the last page. A
+  closing ritual for your journal.
+- **Fiction or nonfiction**: flip the mode per book and the questions reframe
+  around arguments, evidence, and ideas instead of story. Your novels and
+  your history books each get questions that fit.
 - **Spoiler safe**: only text up to your current reading position is ever sent
   to Gemini.
 - **Story focused**: questions are about the book itself, its events,
@@ -66,6 +73,7 @@ Inside `Tools > Reflections > Settings`:
 | Gemini API key | Your key from Google AI Studio | (empty) |
 | Prompts per chapter | 1 to 20 questions per chapter (tap to type a number) | 3 |
 | Questions per session | 1 to 20 questions per session, set inside the session picker | 6 |
+| Questions per book | 1 to 20 questions for the end-of-book reflection, set inside its picker | 6 |
 | Model | Any Gemini model id you want to use | `gemini-3.5-flash-lite` |
 | Generate in background | Make questions automatically as you read | on |
 
@@ -83,6 +91,11 @@ shifting relationships, foreshadowing and payoff, the author's craft, moral
 gray areas, worldbuilding, the emotional arc, and predictions. At 7+
 questions there's a small chance one lens becomes a playful question instead,
 so it stays a rare surprise.
+
+**How the book reflection works**: it samples text from every chapter, so the
+questions cover the full arc. The first 3 are open-ended big-picture
+questions, then the same ten lenses as sessions (framed for a finished book)
+take over past 3, with the same rare playful surprise at 7+.
 
 ## How it works
 

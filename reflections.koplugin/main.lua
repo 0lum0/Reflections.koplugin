@@ -1,7 +1,9 @@
 -- Reflections for KOReader
--- Finish a chapter and Gemini has 1-3 pen-and-paper reflection prompts
--- waiting for you. Chapters are detected as you read; prompts generate in
--- the background the moment you turn the page into a new chapter.
+-- Finish a chapter and Gemini has pen-and-paper reflection prompts waiting
+-- for you, plus session questions spanning the chapters you read and an
+-- end-of-book reflection when you finish. Chapters are detected as you read;
+-- prompts generate in the background the moment you turn the page into a
+-- new chapter.
 -- Chapter tracking approach adapted from xray.koplugin (ultimatejimmy).
 
 local _ = require("gettext")
@@ -21,6 +23,7 @@ local RETIRED_MODELS = {
 }
 local DEFAULT_PROMPT_COUNT = 3
 local DEFAULT_SESSION_PROMPT_COUNT = 6
+local DEFAULT_BOOK_PROMPT_COUNT = 6
 local MAX_PROMPT_COUNT = 20
 
 -- fork()/waitpid() for silent background generation (no UI, ever).
@@ -105,6 +108,29 @@ function Reflections:getSessionPromptCount()
     n = tonumber(n) or DEFAULT_SESSION_PROMPT_COUNT
     if n < 1 or n > MAX_PROMPT_COUNT then n = DEFAULT_SESSION_PROMPT_COUNT end
     return n
+end
+
+function Reflections:getBookPromptCount()
+    local n
+    if G_reader_settings then
+        n = G_reader_settings:readSetting("reflections_book_prompt_count")
+    end
+    if n == nil then n = self:getFileConfig().book_prompt_count end
+    n = tonumber(n) or DEFAULT_BOOK_PROMPT_COUNT
+    if n < 1 or n > MAX_PROMPT_COUNT then n = DEFAULT_BOOK_PROMPT_COUNT end
+    return n
+end
+
+-- Fiction or nonfiction framing for the questions. Per book: a novel and a
+-- history book on the same reader get different questions. New questions
+-- use the current mode; already cached ones stay as generated (hold a
+-- chapter to regenerate it in the new mode).
+function Reflections:isNonfiction()
+    return self:readDocSetting("reflections_nonfiction") == true
+end
+
+function Reflections:setNonfiction(v)
+    self:saveDocSetting("reflections_nonfiction", v and true or false)
 end
 
 function Reflections:getModel()
@@ -208,16 +234,24 @@ function Reflections:editModel()
     dialog:onShowKeyboard()
 end
 
--- Number input for a prompt-count setting. kind is "chapter" or "session".
--- on_done, if given, runs after the dialog closes (e.g. to refresh a menu).
+-- Number input for a prompt-count setting. kind is "chapter", "session",
+-- or "book". on_done, if given, runs after the dialog closes (e.g. to
+-- refresh a menu).
 function Reflections:editPromptCount(kind, on_done)
-    local is_session = kind == "session"
-    local setting = is_session and "reflections_session_prompt_count"
-        or "reflections_prompt_count"
-    local current = is_session and self:getSessionPromptCount()
-        or self:getPromptCount()
-    local title = is_session and _("Questions per session")
-        or _("Prompts per chapter")
+    local setting, current, title
+    if kind == "session" then
+        setting = "reflections_session_prompt_count"
+        current = self:getSessionPromptCount()
+        title = _("Questions per session")
+    elseif kind == "book" then
+        setting = "reflections_book_prompt_count"
+        current = self:getBookPromptCount()
+        title = _("Questions per book reflection")
+    else
+        setting = "reflections_prompt_count"
+        current = self:getPromptCount()
+        title = _("Prompts per chapter")
+    end
     local dialog
     dialog = InputDialog:new{
         title = title,
@@ -407,6 +441,27 @@ end
 -- ------------------------------------------------------------- generation
 
 function Reflections:buildPrompt(title, author, chapter_title, text, n)
+    if self:isNonfiction() then
+        return "You are a reading companion helping someone think deeply "
+            .. "about the nonfiction book they just read. They will answer "
+            .. "with pen and paper in a physical journal, so make each "
+            .. "question open-ended and worth writing about.\n\n"
+            .. "Book: \"" .. title .. "\" by " .. author .. "\n"
+            .. "Chapter: \"" .. chapter_title .. "\"\n\n"
+            .. "Chapter text (may be excerpted; NEVER reference anything "
+            .. "beyond this text):\n---\n" .. text .. "\n---\n\n"
+            .. "Write exactly " .. tostring(n) .. " numbered discussion "
+            .. "questions about THIS chapter, the kind a thoughtful book "
+            .. "club would ask. Rules:\n"
+            .. "- About the ideas themselves: the author's arguments, evidence, key concepts, and real-world applications\n"
+            .. "- Open-ended: no yes/no questions, no single correct answer\n"
+            .. "- Specific to this chapter's arguments, evidence, or ideas\n"
+            .. "- Ask what to question or challenge, not just what to accept\n"
+            .. "- Never ask about the reader's own life, feelings, or experiences\n"
+            .. "- Do not summarize the chapter\n"
+            .. "- Do not reveal or hint at anything not in the text above\n"
+            .. "- Output ONLY the numbered questions, nothing else"
+    end
     return "You are a reading companion helping someone think deeply about "
         .. "the story they just read. They will answer with pen and paper in "
         .. "a physical journal, so make each question open-ended and worth "
@@ -446,6 +501,47 @@ local SESSION_LENSES = {
     "predictions about what comes next",
 }
 
+-- Same idea for the end-of-book reflection, framed around the whole work.
+local BOOK_LENSES = {
+    "plot and events",
+    "characters and their choices",
+    "themes and ideas",
+    "shifting relationships between characters",
+    "foreshadowing and payoff",
+    "the author's craft and structure",
+    "moral gray areas",
+    "worldbuilding and setting",
+    "the emotional arc from beginning to end",
+    "what lingers after the last page",
+}
+
+-- Nonfiction variants: arguments, evidence, and ideas instead of story.
+local NONFICTION_SESSION_LENSES = {
+    "the central arguments and how they're supported",
+    "key ideas and concepts",
+    "evidence and examples",
+    "real-world applications",
+    "what to question or challenge",
+    "how ideas connect across the chapters",
+    "the author's methods and reasoning",
+    "implications and takeaways",
+    "counterarguments and alternative views",
+    "what remains unresolved",
+}
+
+local NONFICTION_BOOK_LENSES = {
+    "the central arguments and how they're supported",
+    "key ideas and concepts",
+    "evidence and examples",
+    "real-world applications",
+    "what to question or challenge",
+    "the author's methods and reasoning",
+    "implications and takeaways",
+    "counterarguments and alternative views",
+    "how the ideas fit together as a whole",
+    "what remains unresolved",
+}
+
 local random_seeded, seed_counter = false, 0
 local function ensureSeeded()
     if random_seeded then return end
@@ -458,12 +554,13 @@ end
 
 -- Pick k lenses in random order, reshuffling the pool when exhausted so
 -- repeats are spaced out.
-local function pickLenses(k)
+local function pickLenses(k, lenses)
+    lenses = lenses or SESSION_LENSES
     ensureSeeded()
     local picked, pool = {}, {}
     local function refill()
         pool = {}
-        for i, lens in ipairs(SESSION_LENSES) do pool[i] = lens end
+        for i, lens in ipairs(lenses) do pool[i] = lens end
         for i = #pool, 2, -1 do
             local j = math.random(i)
             pool[i], pool[j] = pool[j], pool[i]
@@ -484,18 +581,28 @@ end
 -- Returns organic_n, {lens, ...}, playful.
 local PLAYFUL_CHANCE = 0.35
 
-local function sessionPlan(n)
+local function planQuestions(n, lenses)
     if n <= 3 then return n, {}, false end
-    local lenses = pickLenses(n - 3)
+    local picked = pickLenses(n - 3, lenses)
     if n >= 7 and math.random() < PLAYFUL_CHANCE then
-        table.remove(lenses, math.random(#lenses))
-        return 3, lenses, true
+        table.remove(picked, math.random(#picked))
+        return 3, picked, true
     end
-    return 3, lenses, false
+    return 3, picked, false
+end
+
+local function sessionPlan(n, lenses)
+    return planQuestions(n, lenses or SESSION_LENSES)
+end
+
+local function bookPlan(n, lenses)
+    return planQuestions(n, lenses or BOOK_LENSES)
 end
 
 function Reflections:buildSessionPrompt(title, author, from_title, to_title, text, n)
-    local organic_n, lenses, playful = sessionPlan(n)
+    local nf = self:isNonfiction()
+    local organic_n, lenses, playful = sessionPlan(n,
+        nf and NONFICTION_SESSION_LENSES or nil)
 
     local function qword(c, one, many)
         if c == 1 then return "1 " .. one end
@@ -503,10 +610,18 @@ function Reflections:buildSessionPrompt(title, author, from_title, to_title, tex
     end
 
     local steps = {}
-    table.insert(steps, "first write "
-        .. qword(organic_n, "open-ended question", "open-ended questions")
-        .. " about connections ACROSS the chapters: how characters change, "
-        .. "how themes develop, how an event in one chapter reframes another")
+    if nf then
+        table.insert(steps, "first write "
+            .. qword(organic_n, "open-ended question", "open-ended questions")
+            .. " about connections ACROSS the chapters: how arguments build "
+            .. "on each other, how key ideas develop, how evidence in one "
+            .. "chapter supports or challenges another")
+    else
+        table.insert(steps, "first write "
+            .. qword(organic_n, "open-ended question", "open-ended questions")
+            .. " about connections ACROSS the chapters: how characters change, "
+            .. "how themes develop, how an event in one chapter reframes another")
+    end
 
     if #lenses > 0 then
         local bits = {}
@@ -517,16 +632,42 @@ function Reflections:buildSessionPrompt(title, author, from_title, to_title, tex
     end
 
     if playful then
-        table.insert(steps, "finally write 1 playful, creative question: "
-            .. "for example, asking for a better title for one of the "
-            .. "chapters, casting choices for a movie version of a scene, or "
-            .. "a one-sentence dramatic summary of the session")
+        if nf then
+            table.insert(steps, "finally write 1 playful, creative question: "
+                .. "for example, asking for a better title for one of the "
+                .. "chapters, which idea deserves its own TED talk, or "
+                .. "a one-sentence dramatic summary of the session")
+        else
+            table.insert(steps, "finally write 1 playful, creative question: "
+                .. "for example, asking for a better title for one of the "
+                .. "chapters, casting choices for a movie version of a scene, or "
+                .. "a one-sentence dramatic summary of the session")
+        end
     end
 
-    return "You are a reading companion helping someone think deeply about "
-        .. "the story they just read. They read several chapters in one sitting "
-        .. "and will answer with pen and paper in a physical journal, so make "
-        .. "each question open-ended and worth writing about.\n\n"
+    local intro
+    if nf then
+        intro = "You are a reading companion helping someone think deeply "
+            .. "about the nonfiction book they just read. They read several "
+            .. "chapters in one sitting and will answer with pen and paper "
+            .. "in a physical journal, so make each question open-ended and "
+            .. "worth writing about.\n\n"
+    else
+        intro = "You are a reading companion helping someone think deeply about "
+            .. "the story they just read. They read several chapters in one sitting "
+            .. "and will answer with pen and paper in a physical journal, so make "
+            .. "each question open-ended and worth writing about.\n\n"
+    end
+    local about_rule
+    if nf then
+        about_rule = "- About the ideas themselves: the author's arguments, evidence, key concepts, and real-world applications\n"
+            .. "- Ask what to question or challenge, not just what to accept\n"
+    else
+        about_rule = "- About the story itself: its events, characters, choices, themes, and ideas\n"
+            .. "- Never ask what the reader would do in a character's situation\n"
+    end
+
+    return intro
         .. "Book: \"" .. title .. "\" by " .. author .. "\n"
         .. "Chapters read this session: \"" .. from_title .. "\" through \""
         .. to_title .. "\"\n\n"
@@ -536,10 +677,9 @@ function Reflections:buildSessionPrompt(title, author, from_title, to_title, tex
         .. "about THESE chapters as a group, the kind a thoughtful book club "
         .. "would ask, in this order: " .. table.concat(steps, "; ")
         .. ". Rules:\n"
-        .. "- About the story itself: its events, characters, choices, themes, and ideas\n"
+        .. about_rule
         .. "- Open-ended: no yes/no questions, no single correct answer\n"
         .. "- Never ask about the reader's own life, feelings, or experiences\n"
-        .. "- Never ask what the reader would do in a character's situation\n"
         .. "- Do not summarize the chapters\n"
         .. "- Do not reveal or hint at anything not in the text above\n"
         .. "- Output ONLY the numbered questions, nothing else"
@@ -1069,6 +1209,262 @@ function Reflections:showSessionPrompts(key, from_title, to_title, prompts, opt)
     self:showPrompts(key, prompts, opt)
 end
 
+-- --------------------------------------------- end-of-book reflection
+
+-- One set of big-picture questions about the whole work, for when the
+-- reader finishes the book: a closing ritual. Cached per book under its
+-- own key (cleared with everything else by "Clear cached prompts");
+-- "New prompts" regenerates.
+
+function Reflections:getBookReflectionKey()
+    return "book:reflection"
+end
+
+function Reflections:getBookReflectionTitle()
+    local info = Chapters.getBookInfo(self.ui)
+    return _("Reflection on ") .. tostring(info.title)
+end
+
+function Reflections:buildBookPrompt(title, author, text, n)
+    local nf = self:isNonfiction()
+    local organic_n, lenses, playful = bookPlan(n,
+        nf and NONFICTION_BOOK_LENSES or nil)
+
+    local function qword(c, one, many)
+        if c == 1 then return "1 " .. one end
+        return c .. " " .. many
+    end
+
+    local steps = {}
+    if nf then
+        table.insert(steps, "first write "
+            .. qword(organic_n, "open-ended question", "open-ended questions")
+            .. " about the book AS A WHOLE: how the central arguments develop "
+            .. "from beginning to end, what the book is ultimately claiming, "
+            .. "which ideas linger after the last page")
+    else
+        table.insert(steps, "first write "
+            .. qword(organic_n, "open-ended question", "open-ended questions")
+            .. " about the book AS A WHOLE: how characters changed from beginning "
+            .. "to end, what the book is ultimately about, which moments or ideas "
+            .. "linger after the last page")
+    end
+
+    if #lenses > 0 then
+        local bits = {}
+        for _, lens in ipairs(lenses) do
+            table.insert(bits, "1 question about " .. lens)
+        end
+        table.insert(steps, "then write " .. table.concat(bits, ", "))
+    end
+
+    if playful then
+        if nf then
+            table.insert(steps, "finally write 1 playful, creative question: "
+                .. "for example, asking for a better title for the book, which "
+                .. "idea deserves its own TED talk, or a one-sentence dramatic "
+                .. "summary of the whole book")
+        else
+            table.insert(steps, "finally write 1 playful, creative question: "
+                .. "for example, asking for a better title for the book, casting "
+                .. "choices for a movie version, or a one-sentence dramatic "
+                .. "summary of the whole story")
+        end
+    end
+
+    local intro
+    if nf then
+        intro = "You are a reading companion helping someone reflect on a "
+            .. "nonfiction book they just finished. They will answer with pen "
+            .. "and paper in a physical journal, so make each question "
+            .. "open-ended and worth writing about.\n\n"
+    else
+        intro = "You are a reading companion helping someone reflect on a book "
+            .. "they just finished. They will answer with pen and paper in a "
+            .. "physical journal, so make each question open-ended and worth "
+            .. "writing about.\n\n"
+    end
+    local about_rule
+    if nf then
+        about_rule = "- About the ideas themselves: the author's arguments, evidence, key concepts, and real-world applications\n"
+            .. "- Ask what to question or challenge, not just what to accept\n"
+    else
+        about_rule = "- About the story itself: its events, characters, choices, themes, and ideas\n"
+            .. "- Never ask what the reader would do in a character's situation\n"
+    end
+
+    return intro
+        .. "Book: \"" .. title .. "\" by " .. author .. "\n\n"
+        .. "Book text (sampled across all chapters; the reader has finished "
+        .. "the whole book, so nothing here is a spoiler):\n---\n"
+        .. text .. "\n---\n\n"
+        .. "Write exactly " .. tostring(n) .. " numbered discussion questions "
+        .. "about the book as a whole, the kind a thoughtful book club "
+        .. "would ask after everyone finished, in this order: "
+        .. table.concat(steps, "; ") .. ". Rules:\n"
+        .. about_rule
+        .. "- Open-ended: no yes/no questions, no single correct answer\n"
+        .. "- Never ask about the reader's own life, feelings, or experiences\n"
+        .. "- Do not summarize the book\n"
+        .. "- Output ONLY the numbered questions, nothing else"
+end
+
+-- Small picker: generate the book reflection, adjust the question count,
+-- or re-read the saved one.
+function Reflections:showBookPicker()
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local Menu = require("ui/widget/menu")
+    local menu
+    local key = self:getBookReflectionKey()
+    local items = {}
+    local cached = self:readCachedPrompts(key)
+    if cached then
+        table.insert(items, {
+            text = _("Read saved reflection"),
+            callback = function()
+                UIManager:close(menu)
+                self:showPrompts(self:getBookReflectionTitle(), cached,
+                    { from_cache = true,
+                      regen = function() self:generateForBook(true) end })
+            end,
+        })
+    end
+    table.insert(items, {
+        text = _("Generate book reflection"),
+        callback = function()
+            UIManager:close(menu)
+            self:generateForBook(false)
+        end,
+    })
+    table.insert(items, {
+        text_func = function()
+            return _("Questions: ") .. tostring(self:getBookPromptCount())
+        end,
+        callback = function()
+            UIManager:close(menu)
+            self:editPromptCount("book", function()
+                self:showBookPicker()
+            end)
+        end,
+    })
+    table.insert(items, {
+        text = _("Close"),
+        callback = function() UIManager:close(menu) end,
+    })
+    menu = Menu:new{
+        title = _("End of book reflection"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
+-- Generate (or show cached) big-picture questions for the whole book.
+-- Never blocks the UI: the prompts page opens immediately with a
+-- placeholder and fills in when the forked job's result lands.
+function Reflections:generateForBook(force)
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local key = self:getBookReflectionKey()
+    local page_title = self:getBookReflectionTitle()
+    local regen = function()
+        self:generateForBook(true)
+    end
+    if not force then
+        local cached = self:readCachedPrompts(key)
+        if cached then
+            self:showPrompts(page_title, cached,
+                { from_cache = true, regen = regen })
+            return
+        end
+    end
+
+    -- No fork support (never happens on real devices): synchronous fallback.
+    if not ffi_ok then
+        self:generateForBookSync(key, page_title, regen)
+        return
+    end
+
+    -- Regenerating while a job is already running: stop the old one first.
+    if force then
+        local old_job = self._inflight[key]
+        if old_job then
+            pcall(function()
+                if old_job.pid then
+                    ffi.C.kill(old_job.pid, SIGKILL)
+                    ffi.C.waitpid(old_job.pid, nil, 0)
+                end
+            end)
+            pcall(os.remove, old_job.path)
+            self._inflight[key] = nil
+        end
+    end
+
+    self:showPrompts(page_title, _("Generating your prompts…"),
+        { placeholder = true, regen = regen })
+    self._pending = {
+        title = key,
+        page_title = page_title,
+        old = self:readCachedPrompts(key),
+        waited = 0,
+        regen = regen,
+    }
+    local ok, text = pcall(Chapters.getWholeBookText, self.ui)
+    if not ok or not text or #text < 50 then
+        self._pending = nil
+        self:showPrompts(page_title,
+            _("Could not extract enough text from this book."), { regen = regen })
+        return
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt_text = self:buildBookPrompt(info.title, info.author,
+        text, self:getBookPromptCount())
+    self:spawnJob(key, prompt_text, { overwrite = force })
+    self:pollPendingPrompts()
+end
+
+-- Synchronous fallback used only when fork() is unavailable.
+function Reflections:generateForBookSync(key, page_title, regen)
+    local busy = InfoMessage:new{ text = _("Generating reflection prompts...") }
+    UIManager:show(busy)
+    UIManager:forceRePaint()
+
+    local text = Chapters.getWholeBookText(self.ui)
+    if not text or #text < 50 then
+        UIManager:close(busy)
+        UIManager:show(InfoMessage:new{
+            text = _("Could not extract enough text from this book."),
+        })
+        return
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildBookPrompt(info.title, info.author,
+        text, self:getBookPromptCount())
+    local result, err = Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+    UIManager:close(busy)
+
+    if not result then
+        UIManager:show(InfoMessage:new{
+            text = _("Gemini request failed:\n") .. tostring(err),
+        })
+        return
+    end
+    self:cachePrompts(key, result, false)
+    self:showPrompts(page_title, result,
+        { from_cache = false, regen = regen })
+end
+
 -- Watches the forked job started by generateForChapter and swaps the
 -- placeholder page for the real prompts (or a readable error) when it
 -- lands. The UI stays responsive the whole time; pressing Back cancels
@@ -1079,12 +1475,13 @@ function Reflections:pollPendingPrompts()
     UIManager:scheduleIn(2, function()
         if self._pending ~= my then return end -- superseded or cancelled
         pcall(function() self:reapBackgroundJobs() end)
-        -- Sessions render through the same prompts page; their New prompts
-        -- button regenerates the range via the stored regen callback.
+        -- Sessions and book reflections render through the same prompts
+        -- page; their New prompts button regenerates via the stored regen
+        -- callback. page_title may differ from the cache/job key.
         local function showIt(prompts, opt)
             opt = opt or {}
-            if my.session and my.regen then opt.regen = my.regen end
-            self:showPrompts(my.title, prompts, opt)
+            if my.regen then opt.regen = my.regen end
+            self:showPrompts(my.page_title or my.title, prompts, opt)
         end
         local prompts = self:readCachedPrompts(my.title)
         local job_done = self._inflight[my.title] == nil
@@ -1111,7 +1508,8 @@ function Reflections:pollPendingPrompts()
 end
 
 function Reflections:cancelPending(chapter_title)
-    if self._pending and self._pending.title == chapter_title then
+    if self._pending and (self._pending.title == chapter_title
+        or self._pending.page_title == chapter_title) then
         self._pending = nil
     end
 end
@@ -1292,6 +1690,26 @@ function Reflections:showMainScreen()
         callback = function()
             UIManager:close(menu)
             self:showSessionPicker()
+        end,
+    })
+    table.insert(items, {
+        text = _("End of book reflection…"),
+        callback = function()
+            UIManager:close(menu)
+            self:showBookPicker()
+        end,
+    })
+    table.insert(items, {
+        text_func = function()
+            if self:isNonfiction() then
+                return _("Mode: Nonfiction")
+            end
+            return _("Mode: Fiction")
+        end,
+        callback = function()
+            self:setNonfiction(not self:isNonfiction())
+            UIManager:close(menu)
+            self:showMainScreen()
         end,
     })
     table.insert(items, {

@@ -198,9 +198,11 @@ end
 -- Spoiler-safe text for a chapter range (a reading session): concatenates
 -- each chapter's text under a chapter header. Only finished chapters should
 -- be included; callers enforce that. per_chapter_budget caps each chapter's
--- contribution (default 8000), total capped at 30000.
-function Chapters.getRangeText(ui, from_idx, to_idx, per_chapter_budget)
+-- contribution (default 8000), total capped at total_budget (default 30000).
+function Chapters.getRangeText(ui, from_idx, to_idx, per_chapter_budget,
+    total_budget)
     per_chapter_budget = per_chapter_budget or 8000
+    total_budget = total_budget or 30000
     local flat = Chapters.getChapterList(ui)
     if #flat == 0 then return "" end
     from_idx = math.max(1, from_idx or 1)
@@ -217,7 +219,16 @@ function Chapters.getRangeText(ui, from_idx, to_idx, per_chapter_budget)
         end
     end
     if #parts == 0 then return "" end
-    return fitBudget(table.concat(parts, "\n\n"), 30000)
+    return fitBudget(table.concat(parts, "\n\n"), total_budget)
+end
+
+-- Whole-book text for the end-of-book reflection: samples every chapter so
+-- the model sees the full arc. Larger budget than a session, still bounded
+-- for the reader's memory and upload time.
+function Chapters.getWholeBookText(ui)
+    local flat = Chapters.getChapterList(ui)
+    if #flat == 0 then return "" end
+    return Chapters.getRangeText(ui, 1, #flat, 2000, 50000)
 end
 
 return Chapters

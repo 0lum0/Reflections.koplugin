@@ -21,6 +21,9 @@ return {
     -- Reflection prompts per reading session: 1 to 20.
     session_prompt_count = 6,
 
+    -- Questions for the end-of-book reflection: 1 to 20.
+    book_prompt_count = 6,
+
     -- Generate prompts silently in the background when you finish a chapter.
     background = true,
 }
