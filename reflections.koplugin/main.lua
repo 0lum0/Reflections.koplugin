@@ -1050,9 +1050,117 @@ function Reflections:recordSession(key, from_title, to_title)
     for _, s in ipairs(self:getPastSessions()) do
         if s.key ~= key then table.insert(sessions, s) end
     end
-    table.insert(sessions, 1, { key = key, from = from_title, to = to_title })
+    table.insert(sessions, 1, {
+        key = key, from = from_title, to = to_title, at = os.time(),
+    })
     while #sessions > 10 do table.remove(sessions) end
     self:saveDocSetting("reflections_sessions", sessions)
+end
+
+-- The currently active tracked reading session, if one was begun.
+function Reflections:getActiveSession()
+    local s = self:readDocSetting("reflections_active_session")
+    if type(s) == "table" and s.from_idx then return s end
+    return nil
+end
+
+-- Begin a reading session: remember where the reader is now. Ending it
+-- later generates cross-chapter questions for everything read in between.
+function Reflections:beginReadingSession()
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local idx, node = Chapters.findChapter(self.ui, "current")
+    if not idx or not node then
+        UIManager:show(InfoMessage:new{
+            text = _("Couldn't tell which chapter you're in."),
+        })
+        return
+    end
+    self:saveDocSetting("reflections_active_session", {
+        book = self:getBookKey(),
+        from_idx = idx,
+        from_title = node.title,
+        started_at = os.time(),
+    })
+    UIManager:show(InfoMessage:new{
+        text = _("Reading session started at ") .. tostring(node.title)
+            .. _(". End it from Tools > Reflections when you're done reading."),
+    })
+end
+
+-- End the active reading session: generate questions for the chapters read
+-- since it began, quietly. A notification pops up when they're ready in
+-- the Sessions tab.
+function Reflections:endReadingSession()
+    local s = self:getActiveSession()
+    if not s then return end
+    self:saveDocSetting("reflections_active_session", nil)
+    if s.book ~= self:getBookKey() then
+        UIManager:show(InfoMessage:new{
+            text = _("That session was started in another book, so it was discarded."),
+        })
+        return
+    end
+    local cur_idx = Chapters.findChapter(self.ui, "current")
+    cur_idx = cur_idx or s.from_idx
+    local from_idx, to_idx = s.from_idx, cur_idx
+    if from_idx > to_idx then from_idx, to_idx = to_idx, from_idx end
+    local flat = Chapters.getChapterList(self.ui)
+    local from_node, to_node = flat[from_idx], flat[to_idx]
+    if not from_node or not to_node then return end
+    local from_title, to_title = from_node.title, to_node.title
+    -- The final chapter may still be in progress: only text up to the
+    -- reading position goes out (spoiler-safe), like chapter generation.
+    local text_idx = (to_idx == cur_idx) and cur_idx or nil
+    local ok, text = pcall(Chapters.getRangeText, self.ui,
+        from_idx, to_idx, nil, nil, text_idx)
+    if not ok or not text or #text < 50 then
+        UIManager:show(InfoMessage:new{
+            text = _("Could not extract enough chapter text."),
+        })
+        return
+    end
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local key = self:getSessionKey(from_title, to_title)
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt_text = self:buildSessionPrompt(info.title, info.author,
+        from_title, to_title, text, self:getSessionPromptCount())
+    -- Stop any stale job for this key first, like the manual flow does.
+    local old_job = self._inflight[key]
+    if old_job then
+        pcall(function()
+            if old_job.pid then
+                ffi.C.kill(old_job.pid, SIGKILL)
+                ffi.C.waitpid(old_job.pid, nil, 0)
+            end
+        end)
+        pcall(os.remove, old_job.path)
+        self._inflight[key] = nil
+    end
+    self:recordSession(key, from_title, to_title)
+    -- Quiet: no prompts page. When the result lands, the reader gets a
+    -- notification pointing at the Sessions tab instead.
+    self._pending = {
+        title = key,
+        old = self:readCachedPrompts(key),
+        waited = 0,
+        quiet = true,
+    }
+    local regen = function()
+        self:generateForSession(from_title, to_title, true)
+    end
+    self._pending.regen = regen
+    self:spawnJob(key, prompt_text, { overwrite = true })
+    self:pollPendingPrompts()
 end
 
 -- Range picker: choose the first and last chapter of the session from the
@@ -1144,6 +1252,140 @@ function Reflections:showSessionPicker()
     })
     menu = Menu:new{
         title = _("Session questions"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
+-- Sessions tab: past reading sessions with the date and time each was
+-- generated, plus the manual chapter-range picker.
+function Reflections:showSessionsScreen()
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local Menu = require("ui/widget/menu")
+    local menu
+    local items = {
+        {
+            text = _("Pick chapters manually…"),
+            callback = function()
+                UIManager:close(menu)
+                self:showSessionPicker()
+            end,
+        },
+    }
+    for _, s in ipairs(self:getPastSessions()) do
+        local sess = s
+        local label
+        if sess.at then
+            label = os.date("%b %d, %I:%M %p", sess.at) .. " · " .. sess.key
+        else
+            label = sess.key
+        end
+        table.insert(items, {
+            text = label,
+            callback = function()
+                UIManager:close(menu)
+                local cached = self:readCachedPrompts(sess.key)
+                if cached then
+                    self:showSessionPrompts(sess.key, sess.from, sess.to,
+                        cached, { from_cache = true })
+                elseif self._inflight[sess.key] then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Still generating, check back in a moment."),
+                    })
+                else
+                    self:generateForSession(sess.from, sess.to, false)
+                end
+            end,
+            hold_callback = function()
+                UIManager:close(menu)
+                self:generateForSession(sess.from, sess.to, true)
+            end,
+        })
+    end
+    table.insert(items, {
+        text = _("Close"),
+        callback = function() UIManager:close(menu) end,
+    })
+    menu = Menu:new{
+        title = _("Sessions"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
+-- Standalone Settings screen, also reachable from Tools > Reflections.
+function Reflections:showSettingsScreen()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local function countRow(label, kind, get)
+        return {
+            text_func = function()
+                return label .. tostring(get(self))
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:editPromptCount(kind, function()
+                    self:showSettingsScreen()
+                end)
+            end,
+        }
+    end
+    local items = {
+        {
+            text_func = function()
+                local k = self:getApiKey()
+                if k ~= "" then
+                    -- Fingerprint, not the key: enough to spot a typo.
+                    local fp = k:sub(1, 6) .. "..." .. k:sub(-4)
+                        .. " (" .. #k .. " chars)"
+                    return _("Gemini API key: set [") .. fp .. "]"
+                end
+                return _("Gemini API key: missing")
+            end,
+            callback = function() self:editApiKey() end,
+        },
+        countRow(_("Prompts per chapter: "), "chapter",
+            Reflections.getPromptCount),
+        countRow(_("Prompts per session: "), "session",
+            Reflections.getSessionPromptCount),
+        countRow(_("Prompts per book reflection: "), "book",
+            Reflections.getBookPromptCount),
+        {
+            text_func = function()
+                return _("Model: ") .. self:getModel()
+            end,
+            callback = function() self:editModel() end,
+        },
+        {
+            text_func = function()
+                if self:getBackgroundEnabled() then
+                    return _("Generate in background: on")
+                end
+                return _("Generate in background: off")
+            end,
+            callback = function()
+                UIManager:close(menu)
+                G_reader_settings:saveSetting(
+                    "reflections_background", not self:getBackgroundEnabled())
+                self:showSettingsScreen()
+            end,
+        },
+        {
+            text = _("Close"),
+            callback = function() UIManager:close(menu) end,
+        },
+    }
+    menu = Menu:new{
+        title = _("Settings"),
         item_table = items,
         is_popout = false,
         is_borderless = true,
@@ -1562,20 +1804,72 @@ function Reflections:pollPendingPrompts()
         local job_done = self._inflight[my.title] == nil
         if prompts and (prompts ~= my.old or job_done) then
             self._pending = nil
-            showIt(prompts, { from_cache = false })
+            if my.simplify then
+                -- Throwaway reword job: keep it off the prompt cache and
+                -- put the result on the open page, if it still wants it.
+                self:deleteCachedPrompts(my.title)
+                local page = self._open_prompts
+                if page and page.simplify_on and not page.simplified then
+                    page.simplified = prompts
+                    self:showPrompts(page.title, prompts,
+                        { display_only = true, from_cache = page.from_cache })
+                end
+            elseif my.quiet then
+                -- Tracked reading session: no prompts page, just a
+                -- notification pointing at the Sessions tab.
+                UIManager:show(InfoMessage:new{
+                    text = _("Session prompts have been generated and sent to the Sessions tab."),
+                })
+            else
+                showIt(prompts, { from_cache = false })
+            end
             return
         end
         local err = self._job_errors[my.title]
         if err then
             self._pending = nil
             self._job_errors[my.title] = nil
-            showIt(_("Gemini request failed: ") .. tostring(err), {})
+            if my.simplify then
+                local page = self._open_prompts
+                if page and page.simplify_on then
+                    page.simplify_on = false
+                    UIManager:show(InfoMessage:new{
+                        text = _("Couldn't simplify right now."),
+                    })
+                    self:showPrompts(page.title, page.canonical,
+                        { display_only = true, from_cache = page.from_cache })
+                end
+            elseif my.quiet then
+                UIManager:show(InfoMessage:new{
+                    text = _("Session prompts failed: ") .. tostring(err),
+                })
+            else
+                showIt(_("Gemini request failed: ") .. tostring(err),
+                    { is_error = true })
+            end
             return
         end
         my.waited = my.waited + 2
         if my.waited >= 330 then
             self._pending = nil
-            showIt(_("Gemini is taking too long. Check your connection and try again."), {})
+            if my.simplify then
+                local page = self._open_prompts
+                if page and page.simplify_on then
+                    page.simplify_on = false
+                    UIManager:show(InfoMessage:new{
+                        text = _("Couldn't simplify right now."),
+                    })
+                    self:showPrompts(page.title, page.canonical,
+                        { display_only = true, from_cache = page.from_cache })
+                end
+            elseif my.quiet then
+                UIManager:show(InfoMessage:new{
+                    text = _("Session prompts are taking too long. Check your connection and try again."),
+                })
+            else
+                showIt(_("Gemini is taking too long. Check your connection and try again."),
+                    { is_error = true })
+            end
             return
         end
         self:pollPendingPrompts()
@@ -1621,12 +1915,22 @@ end
 -- and Back buttons. A dedicated screen, not an overlay dialog.
 -- opt may be a boolean (from_cache) or a table { from_cache, placeholder }.
 function Reflections:showPrompts(chapter_title, prompts, opt)
-    local from_cache, placeholder
+    local from_cache, placeholder, display_only, is_error
     if type(opt) == "table" then
         from_cache, placeholder = opt.from_cache, opt.placeholder
+        display_only = opt.display_only
+        is_error = opt.is_error
     else
         from_cache = opt
     end
+
+    -- Per-page simplify state. Rebuilding the same page (placeholder swaps,
+    -- simplify toggles) keeps it; opening a different page starts fresh.
+    local prev = self._open_prompts
+    local same_page = prev and prev.title == chapter_title
+    -- A fresh result landing while simplify is on gets reworded automatically.
+    local auto_simplify = same_page and prev.simplify_on
+        and not placeholder and not display_only and not is_error
 
     -- Replace any prompts page already on screen (e.g. placeholder -> result).
     if self._open_prompts then
@@ -1645,6 +1949,32 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
     local TextWidget = require("ui/widget/textwidget")
     local ScrollTextWidget = require("ui/widget/scrolltextwidget")
     local Button = require("ui/widget/button")
+    local CheckButton = require("ui/widget/checkbutton")
+
+    -- Page state, computed before the dialog so the toggle reflects it.
+    local page = {
+        title = chapter_title,
+        from_cache = from_cache and true or false,
+        simplify_on = false,
+        canonical = nil, -- questions as generated (never the reworded text)
+        simplified = nil, -- reworded questions, once fetched
+        -- New prompts keeps working after toggle rebuilds (sessions, book).
+        regen = (type(opt) == "table" and opt.regen)
+            or (same_page and prev.regen) or nil,
+    }
+    if same_page then
+        page.simplify_on = prev.simplify_on
+        page.canonical = prev.canonical
+        page.simplified = prev.simplified
+        page.from_cache = prev.from_cache
+        if not placeholder and not display_only and not is_error then
+            -- Fresh canonical questions; any simplified text is stale now.
+            page.canonical = prompts
+            if prev.simplify_on then page.simplified = nil end
+        end
+    elseif not placeholder and not is_error then
+        page.canonical = prompts
+    end
 
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local pad = Screen:scaleBySize(16)
@@ -1656,8 +1986,9 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
     end
 
     local body
-    if placeholder then
-        body = prompts -- already a status line like "Generating your prompts…"
+    if placeholder or auto_simplify then
+        -- auto_simplify shows its own status line while the reword runs
+        body = auto_simplify and _("Simplifying…") or prompts
     else
         local header = _("Grab your journal and a pen.")
         if from_cache then
@@ -1703,12 +2034,18 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
                 Button:new{
                     text = _("New prompts"),
                     callback = function()
-                        if type(opt) == "table" and opt.regen then
-                            opt.regen()
+                        if page.regen then
+                            page.regen()
                         else
                             self:generateForChapter(chapter_title, true)
                         end
                     end,
+                },
+                HorizontalSpan:new{ width = pad },
+                CheckButton:new{
+                    text = _("Simplify"),
+                    checked = page.simplify_on,
+                    callback = function() self:toggleSimplify() end,
                 },
                 HorizontalSpan:new{ width = pad },
                 Button:new{
@@ -1719,8 +2056,105 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
         },
     }
     scroll_widget.dialog = dialog
-    self._open_prompts = { title = chapter_title, dialog = dialog }
+    page.dialog = dialog
+    self._open_prompts = page
     UIManager:show(dialog)
+
+    if auto_simplify then
+        self:requestSimplify()
+    end
+end
+
+-- ---------------------------------------------------------------- simplify
+
+-- Build the reword prompt: the same questions, lighter and more relaxed.
+-- Never dumbs them down, just easier to sit with.
+function Reflections:buildSimplifyPrompt(questions)
+    return "Reword these discussion questions to be simpler, lighter, and "
+        .. "more relaxed. Keep the same substance, specificity, and details "
+        .. "-- don't dumb them down, just make them easier to sit with on a "
+        .. "quiet day. Output ONLY the numbered questions, nothing else.\n\n"
+        .. "Questions:\n---\n" .. questions .. "\n---"
+end
+
+-- The Simplify switch on the prompts page. Scoped to the open page only:
+-- it rewords the current questions in place, never the cached originals.
+-- Regenerating while it is on rewords the fresh questions automatically.
+function Reflections:toggleSimplify()
+    local page = self._open_prompts
+    if not page or not page.canonical then
+        UIManager:show(InfoMessage:new{
+            text = _("Wait for the questions to load first."),
+        })
+        return
+    end
+    if page.simplify_on then
+        page.simplify_on = false
+        self:showPrompts(page.title, page.canonical,
+            { display_only = true, from_cache = page.from_cache })
+    elseif page.simplified then
+        page.simplify_on = true
+        self:showPrompts(page.title, page.simplified,
+            { display_only = true, from_cache = page.from_cache })
+    else
+        page.simplify_on = true
+        self:showPrompts(page.title, _("Simplifying…"), { placeholder = true })
+        self:requestSimplify()
+    end
+end
+
+-- Reword the open page's canonical questions in a background job.
+-- The result lives on the page only, never in the prompt cache.
+function Reflections:requestSimplify()
+    local page = self._open_prompts
+    if not page or not page.canonical or not page.simplify_on then return end
+    if self:getApiKey() == "" then
+        page.simplify_on = false
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        self:showPrompts(page.title, page.canonical,
+            { display_only = true, from_cache = page.from_cache })
+        return
+    end
+    local prompt = self:buildSimplifyPrompt(page.canonical)
+    if not ffi_ok then
+        -- Synchronous fallback (never happens on real devices).
+        local okc, result =
+            pcall(Gemini.generate, self:getApiKey(), self:getModelChain(),
+                prompt, 45, 1)
+        if okc and result then
+            page.simplified = result
+            self:showPrompts(page.title, result,
+                { display_only = true, from_cache = page.from_cache })
+        else
+            page.simplify_on = false
+            UIManager:show(InfoMessage:new{
+                text = _("Couldn't simplify right now."),
+            })
+            self:showPrompts(page.title, page.canonical,
+                { display_only = true, from_cache = page.from_cache })
+        end
+        return
+    end
+    local key = "\0simplify:" .. page.title .. ":" .. tostring(os.time())
+    self._pending = { title = key, old = nil, waited = 0, simplify = true }
+    self:spawnJob(key, prompt, { overwrite = true })
+    self:pollPendingPrompts()
+end
+
+-- Drop a cached entry (used for the throwaway simplify job results).
+function Reflections:deleteCachedPrompts(key)
+    local ds = self:getDocStore()
+    if not ds then return end
+    pcall(function()
+        local cache = ds:readSetting("reflections_cache")
+        if type(cache) == "table" then
+            cache[key] = nil
+            ds:saveSetting("reflections_cache", cache)
+            if ds.flush then ds:flush() end
+        end
+    end)
 end
 
 -- ------------------------------------------------------------------ screens
@@ -1874,7 +2308,43 @@ function Reflections:addToMainMenu(menu_items)
     menu_items.reflections = {
         text = _("Reflections"),
         sorting_hint = "tools",
-        callback = function() self:showMainScreen() end,
+        sub_item_table_func = function() return self:getSubMenuItems() end,
+    }
+end
+
+-- Tools > Reflections opens this submenu; each entry opens its own screen.
+-- The Begin/End session entry is rebuilt every time so its label always
+-- reflects whether a reading session is active.
+function Reflections:getSubMenuItems()
+    local toggle_text = _("Begin a reading session")
+    local active = self:getActiveSession()
+    if active then
+        toggle_text = _("End session (started ")
+            .. os.date("%I:%M %p", active.started_at) .. ")"
+    end
+    return {
+        {
+            text = _("Chapters"),
+            callback = function() self:showMainScreen() end,
+        },
+        {
+            text = _("Sessions"),
+            callback = function() self:showSessionsScreen() end,
+        },
+        {
+            text = toggle_text,
+            callback = function()
+                if self:getActiveSession() then
+                    self:endReadingSession()
+                else
+                    self:beginReadingSession()
+                end
+            end,
+        },
+        {
+            text = _("Settings"),
+            callback = function() self:showSettingsScreen() end,
+        },
     }
 end
 

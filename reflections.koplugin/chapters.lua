@@ -199,8 +199,10 @@ end
 -- each chapter's text under a chapter header. Only finished chapters should
 -- be included; callers enforce that. per_chapter_budget caps each chapter's
 -- contribution (default 8000), total capped at total_budget (default 30000).
+-- When cur_idx is given, that chapter is treated as "current" (only text up
+-- to the reading position is used); all others are "previous".
 function Chapters.getRangeText(ui, from_idx, to_idx, per_chapter_budget,
-    total_budget)
+    total_budget, cur_idx)
     per_chapter_budget = per_chapter_budget or 8000
     total_budget = total_budget or 30000
     local flat = Chapters.getChapterList(ui)
@@ -211,8 +213,9 @@ function Chapters.getRangeText(ui, from_idx, to_idx, per_chapter_budget,
     local parts = {}
     for i = from_idx, to_idx do
         local node = flat[i]
+        local which = (cur_idx and i == cur_idx) and "current" or "previous"
         local ok, text = pcall(Chapters.getChapterText, ui, node, flat[i + 1],
-            "previous", per_chapter_budget)
+            which, per_chapter_budget)
         if ok and text and #text >= 50 then
             table.insert(parts, "--- Chapter: "
                 .. tostring(node.title or ("#" .. i)) .. " ---\n" .. text)
