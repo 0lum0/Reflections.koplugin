@@ -481,7 +481,27 @@ end
 
 -- ------------------------------------------------------------- generation
 
-function Reflections:buildPrompt(title, author, chapter_title, text, n)
+-- Shared craft rules: keep questions sharp and journal-sized, never homework.
+local CRAFT_RULES =
+    "- Each question should invite a few sentences of journaling: "
+    .. "one sharp thing to think about, not an essay topic\n"
+    .. "- Never ask 'what is the significance of X' or 'how does X shape "
+    .. "our understanding of Y'; find a sharper, more specific angle\n"
+    .. "- At least one question should zoom in on a single moment, choice, "
+    .. "or line rather than a broad theme\n"
+    .. "- Don't embed the answer in the question; leave the conclusion "
+    .. "genuinely open\n"
+
+-- When regenerating, show the model what it already asked so it asks
+-- different questions instead of rewording the same ones.
+local function avoidRepeat(old)
+    if not old or old == "" then return "" end
+    return "\nThe reader already saw these questions:\n---\n" .. old
+        .. "\n---\nAsk DIFFERENT questions: different moments, different "
+        .. "angles, no repeats."
+end
+
+function Reflections:buildPrompt(title, author, chapter_title, text, n, old)
     if self:isNonfiction() then
         return "You are a reading companion helping someone think deeply "
             .. "about the nonfiction book they just read. They will answer "
@@ -501,7 +521,9 @@ function Reflections:buildPrompt(title, author, chapter_title, text, n)
             .. "- Never ask about the reader's own life, feelings, or experiences\n"
             .. "- Do not summarize the chapter\n"
             .. "- Do not reveal or hint at anything not in the text above\n"
+            .. CRAFT_RULES
             .. "- Output ONLY the numbered questions, nothing else"
+            .. avoidRepeat(old)
     end
     return "You are a reading companion helping someone think deeply about "
         .. "the story they just read. They will answer with pen and paper in "
@@ -521,7 +543,9 @@ function Reflections:buildPrompt(title, author, chapter_title, text, n)
         .. "- Never ask what the reader would do in a character's situation\n"
         .. "- Do not summarize the chapter\n"
         .. "- Do not reveal or hint at anything not in the text above\n"
+        .. CRAFT_RULES
         .. "- Output ONLY the numbered questions, nothing else"
+        .. avoidRepeat(old)
 end
 
 -- Prompt for a reading session: several chapters read in one sitting.
@@ -640,7 +664,7 @@ local function bookPlan(n, lenses)
     return planQuestions(n, lenses or BOOK_LENSES)
 end
 
-function Reflections:buildSessionPrompt(title, author, from_title, to_title, text, n)
+function Reflections:buildSessionPrompt(title, author, from_title, to_title, text, n, old)
     local nf = self:isNonfiction()
     local organic_n, lenses, playful = sessionPlan(n,
         nf and NONFICTION_SESSION_LENSES or nil)
@@ -723,7 +747,9 @@ function Reflections:buildSessionPrompt(title, author, from_title, to_title, tex
         .. "- Never ask about the reader's own life, feelings, or experiences\n"
         .. "- Do not summarize the chapters\n"
         .. "- Do not reveal or hint at anything not in the text above\n"
+        .. CRAFT_RULES
         .. "- Output ONLY the numbered questions, nothing else"
+        .. avoidRepeat(old)
 end
 
 -- A short stable key for this book, used to name background result files.
@@ -797,7 +823,8 @@ function Reflections:launchGeneration(chapter_title, node, next_node, opts)
     if not ok or not text or #text < 50 then return false end
     local info = Chapters.getBookInfo(self.ui)
     local prompt_text = self:buildPrompt(
-        info.title, info.author, chapter_title, text, self:getPromptCount())
+        info.title, info.author, chapter_title, text, self:getPromptCount(),
+        opts.overwrite and self:readCachedPrompts(chapter_title) or nil)
     return self:spawnJob(chapter_title, prompt_text, opts)
 end
 
@@ -1201,7 +1228,8 @@ function Reflections:generateForSession(from_title, to_title, force)
     end
     local info = Chapters.getBookInfo(self.ui)
     local prompt_text = self:buildSessionPrompt(info.title, info.author,
-        from_title, to_title, text, self:getSessionPromptCount())
+        from_title, to_title, text, self:getSessionPromptCount(),
+        force and self:readCachedPrompts(key) or nil)
     self:spawnJob(key, prompt_text, { overwrite = force })
     self:recordSession(key, from_title, to_title)
     self:pollPendingPrompts()
@@ -1269,7 +1297,7 @@ function Reflections:getBookReflectionTitle()
     return _("Reflection on ") .. tostring(info.title)
 end
 
-function Reflections:buildBookPrompt(title, author, text, n)
+function Reflections:buildBookPrompt(title, author, text, n, old)
     local nf = self:isNonfiction()
     local organic_n, lenses, playful = bookPlan(n,
         nf and NONFICTION_BOOK_LENSES or nil)
@@ -1350,7 +1378,9 @@ function Reflections:buildBookPrompt(title, author, text, n)
         .. "- Open-ended: no yes/no questions, no single correct answer\n"
         .. "- Never ask about the reader's own life, feelings, or experiences\n"
         .. "- Do not summarize the book\n"
+        .. CRAFT_RULES
         .. "- Output ONLY the numbered questions, nothing else"
+        .. avoidRepeat(old)
 end
 
 -- Small picker: generate the book reflection, adjust the question count,
@@ -1472,7 +1502,8 @@ function Reflections:generateForBook(force)
     end
     local info = Chapters.getBookInfo(self.ui)
     local prompt_text = self:buildBookPrompt(info.title, info.author,
-        text, self:getBookPromptCount())
+        text, self:getBookPromptCount(),
+        force and self:readCachedPrompts(key) or nil)
     self:spawnJob(key, prompt_text, { overwrite = force })
     self:pollPendingPrompts()
 end
