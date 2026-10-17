@@ -1833,6 +1833,9 @@ function Reflections:showMainScreen()
         is_popout = false,
         is_borderless = true,
     }
+    -- Start on the last page: the latest chapters and the settings entries
+    -- live there, so the reader lands where they left off.
+    menu:switchItemTable(nil, nil, #items)
     UIManager:show(menu)
 end
 
