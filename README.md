@@ -1,20 +1,31 @@
 # Reflections for KOReader
 
 A KOReader plugin that writes thoughtful discussion questions for every
-chapter you finish, and for whole reading sessions, using the Gemini API.
-Answer them with pen and paper, like a book club for one.
+chapter you finish, for whole reading sessions, and for the finished book,
+using the Gemini API. Answer them with pen and paper, like a book club for
+one.
 
 ## What it does
 
 - **Tracks your chapters** from the book's table of contents as you read.
 - **Generates reflection prompts in the background**, silently, the moment you
   reach a new chapter. Nothing ever appears on your reading screen.
-- **Chapter browser**: open `Tools > Reflections` to see every chapter you've
-  read so far. Tap one to read its questions; hold one to generate a fresh set.
-- **Session questions**: read several chapters in one sitting? Pick the first
-  and last chapter and get questions about the whole range, focused on how
-  characters change and themes develop across chapters. Past sessions are
-  remembered for re-reading.
+- **A proper submenu**: `Tools > Reflections` opens Chapters, Sessions, End
+  of book reflection, Begin/End reading session, Fiction/Nonfiction mode, and
+  Settings. It pins itself to the top of the Tools menu.
+- **Chapter browser**: open Chapters to see every chapter you've read so far.
+  Tap one to read its questions; hold one to generate a fresh set. It opens
+  on the last page, where you left off.
+- **Reading sessions**: begin a session when you start reading and end it
+  when you stop. Questions generate quietly for exactly what you covered,
+  and a small notification tells you when they're waiting in the Sessions
+  tab. Prefer to pick manually? Choose the first and last chapter yourself.
+  Past sessions are listed newest first with date and time, and kept for
+  re-reading. End a session on the very first page of a chapter and that
+  chapter is left out, so questions never touch what you haven't read.
+- **Simplify toggle**: a checkbox on any questions page that rewords the set
+  to be lighter and more relaxed, without dumbing it down. Leave it on and
+  new questions come out simplified too. Made for slow reading days.
 - **End of book reflection**: finished the book? Get one set of big-picture
   questions about the whole work: how characters changed from beginning to
   end, what it's ultimately about, what lingers after the last page. A
@@ -64,8 +75,8 @@ Answer them with pen and paper, like a book club for one.
 
 Open a book and read. When you finish a chapter, its questions generate
 quietly in the background. Open `Tools > Reflections` any time to browse
-chapters and read their prompts. Generation usually takes 10 to 30 seconds on
-decent Wi-Fi.
+chapters, sessions, and settings. Generation usually takes 10 to 30 seconds
+on decent Wi-Fi.
 
 ## Settings
 
@@ -75,17 +86,19 @@ Inside `Tools > Reflections > Settings`:
 |---|---|---|
 | Gemini API key | Your key from Google AI Studio | (empty) |
 | Prompts per chapter | 1 to 20 questions per chapter (tap to type a number) | 3 |
-| Questions per session | 1 to 20 questions per session, set inside the session picker | 6 |
-| Questions per book | 1 to 20 questions for the end-of-book reflection, set inside its picker | 6 |
+| Prompts per session | 1 to 20 questions per session | 6 |
+| Prompts per book reflection | 1 to 20 questions for the end-of-book reflection | 6 |
 | Model | Any Gemini model id you want to use | `gemini-3.5-flash-lite` |
 | Generate in background | Make questions automatically as you read | on |
 
 **About the model**: the plugin uses `gemini-3.5-flash-lite` out of the box.
 It's fast, cheap, and more than capable of writing good discussion questions.
 
-**Clearing saved questions**: the chapter list has a *Clear cached prompts*
+**Clearing saved questions**: Settings has a *Clear cached reflections*
 entry (with a confirmation step) that wipes every saved question for the
-current book. Holding a single chapter regenerates just that chapter.
+current book, including your previous sessions list. A checkbox lets you keep
+the sessions if you'd rather. Holding a single chapter regenerates just that
+chapter.
 
 **How session questions are built**: the first 3 are always open-ended
 cross-chapter questions. Past 3, each question takes one random lens from ten
