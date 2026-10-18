@@ -874,6 +874,41 @@ end
 -- errors) and writes the result to a temp file, which the parent picks up
 -- later. key identifies the job: a chapter title or a session key.
 -- Returns true when a job is now running (or already was).
+-- fork() children are unreliable on Android: they can wedge in the
+-- network stack, and a blocking waitpid() on the UI thread then freezes
+-- the whole reader on "Generating your prompts...". Android therefore
+-- uses the synchronous request path everywhere (X-RAY's Gemini requests
+-- are synchronous on every platform, which is why the same key works
+-- there); the network and keys are proven fine, the fork is the problem.
+function Reflections:isAndroid()
+    local ok, dev = pcall(require, "device")
+    return ok and dev and type(dev.isAndroid) == "function"
+        and dev:isAndroid() or false
+end
+
+function Reflections:shouldFork()
+    return ffi_ok and not self:isAndroid()
+end
+
+-- Stop a forked job without ever blocking the UI thread: SIGKILL, a few
+-- non-blocking reaps, then abandon the pid if it still won't die. A
+-- wedged child must never freeze the reader on waitpid().
+function Reflections:stopJob(job)
+    if not job or not ffi_ok then return end
+    pcall(os.remove, job.path)
+    if not job.pid then return end
+    pcall(function() ffi.C.kill(job.pid, SIGKILL) end)
+    local ok_sock, socket = pcall(require, "socket")
+    for _ = 1, 10 do
+        local done = ffi.C.waitpid(job.pid, nil, WNOHANG)
+        if done == job.pid or done == -1 then return end
+        if ok_sock and socket and socket.sleep then
+            pcall(socket.sleep, 0.05)
+        end
+    end
+    -- Still alive: abandon it. init reaps the zombie when KOReader exits.
+end
+
 function Reflections:spawnJob(key, prompt_text, opts)
     opts = opts or {}
     if self._inflight[key] then return true end
@@ -934,7 +969,7 @@ end
 -- on later page turns (see reapBackgroundJobs).
 function Reflections:maybeBackgroundGenerate(chapter_title, node, next_node)
     if not self:getBackgroundEnabled() then return end
-    if not ffi_ok then return end -- no fork support: falls back to tap-to-generate
+    if not self:shouldFork() then return end -- no fork (or Android): falls back to tap-to-generate
     if self:getApiKey() == "" then return end
     if self._inflight[chapter_title] then return end
     local cached = self:readCachedPrompts(chapter_title)
@@ -956,9 +991,7 @@ function Reflections:reapBackgroundJobs()
                 self:collectJobResult(job)
                 self._inflight[title] = nil
             elseif os.time() - job.started > 300 then
-                ffi.C.kill(job.pid, SIGKILL)
-                ffi.C.waitpid(job.pid, nil, 0)
-                os.remove(job.path)
+                self:stopJob(job)
                 self._inflight[title] = nil
             end
         end
@@ -1040,8 +1073,8 @@ function Reflections:generateForChapter(chapter_title, force, opts)
     local cur_idx, cur = Chapters.findChapter(self.ui, "current")
     if cur and cur.title == chapter_title then kind = "current" end
 
-    -- No fork support (never happens on real devices): synchronous fallback.
-    if not ffi_ok then
+    -- No fork support (Android never forks (unreliable there)): synchronous fallback.
+    if not self:shouldFork() then
         self:generateForChapterSync(chapter_title, node, next_node, kind, opts.partial)
         return
     end
@@ -1051,13 +1084,7 @@ function Reflections:generateForChapter(chapter_title, force, opts)
     if force then
         local old_job = self._inflight[chapter_title]
         if old_job then
-            pcall(function()
-                if old_job.pid then
-                    ffi.C.kill(old_job.pid, SIGKILL)
-                    ffi.C.waitpid(old_job.pid, nil, 0)
-                end
-            end)
-            pcall(os.remove, old_job.path)
+            self:stopJob(old_job)
             self._inflight[chapter_title] = nil
         end
     end
@@ -1311,16 +1338,31 @@ function Reflections:endReadingSession()
     -- Stop any stale job for this key first, like the manual flow does.
     local old_job = self._inflight[key]
     if old_job then
-        pcall(function()
-            if old_job.pid then
-                ffi.C.kill(old_job.pid, SIGKILL)
-                ffi.C.waitpid(old_job.pid, nil, 0)
-            end
-        end)
-        pcall(os.remove, old_job.path)
+        self:stopJob(old_job)
         self._inflight[key] = nil
     end
     self:recordSession(key, from_title, to_title)
+    if not self:shouldFork() then
+        -- Android: fork is unreliable, so run the request directly with a
+        -- busy note (the user just tapped End session; a short wait is fine).
+        local busy = InfoMessage:new{ text = _("Generating session prompts...") }
+        UIManager:show(busy)
+        UIManager:forceRePaint()
+        local result, err = Gemini.generate(self:getApiKey(),
+            self:getModelChain(), prompt_text, 45, 1)
+        UIManager:close(busy)
+        if result then
+            self:cachePrompts(key, result, false)
+            UIManager:show(InfoMessage:new{
+                text = _("Session prompts have been generated and sent to the Sessions tab."),
+            })
+        else
+            UIManager:show(InfoMessage:new{
+                text = _("Session prompts failed: ") .. tostring(err),
+            })
+        end
+        return
+    end
     -- Quiet: no prompts page. When the result lands, the reader gets a
     -- notification pointing at the Sessions tab instead.
     self._pending = {
@@ -1744,8 +1786,8 @@ function Reflections:generateForSession(from_title, to_title, force)
         end
     end
 
-    -- No fork support (never happens on real devices): synchronous fallback.
-    if not ffi_ok then
+    -- No fork support (Android never forks (unreliable there)): synchronous fallback.
+    if not self:shouldFork() then
         self:generateForSessionSync(key, from_title, to_title,
             from_idx, to_idx, regen)
         return
@@ -1755,13 +1797,7 @@ function Reflections:generateForSession(from_title, to_title, force)
     if force then
         local old_job = self._inflight[key]
         if old_job then
-            pcall(function()
-                if old_job.pid then
-                    ffi.C.kill(old_job.pid, SIGKILL)
-                    ffi.C.waitpid(old_job.pid, nil, 0)
-                end
-            end)
-            pcall(os.remove, old_job.path)
+            self:stopJob(old_job)
             self._inflight[key] = nil
         end
     end
@@ -1822,8 +1858,8 @@ function Reflections:generateForPageSession(from_page, to_page, force)
         end
     end
 
-    -- No fork support (never happens on real devices): synchronous fallback.
-    if not ffi_ok then
+    -- No fork support (Android never forks (unreliable there)): synchronous fallback.
+    if not self:shouldFork() then
         self:generateForPageSessionSync(key, from_label, to_label,
             from_page, to_page, regen)
         return
@@ -1832,13 +1868,7 @@ function Reflections:generateForPageSession(from_page, to_page, force)
     if force then
         local old_job = self._inflight[key]
         if old_job then
-            pcall(function()
-                if old_job.pid then
-                    ffi.C.kill(old_job.pid, SIGKILL)
-                    ffi.C.waitpid(old_job.pid, nil, 0)
-                end
-            end)
-            pcall(os.remove, old_job.path)
+            self:stopJob(old_job)
             self._inflight[key] = nil
         end
     end
@@ -2129,8 +2159,8 @@ function Reflections:generateForBook(force)
         end
     end
 
-    -- No fork support (never happens on real devices): synchronous fallback.
-    if not ffi_ok then
+    -- No fork support (Android never forks (unreliable there)): synchronous fallback.
+    if not self:shouldFork() then
         self:generateForBookSync(key, page_title, regen)
         return
     end
@@ -2139,13 +2169,7 @@ function Reflections:generateForBook(force)
     if force then
         local old_job = self._inflight[key]
         if old_job then
-            pcall(function()
-                if old_job.pid then
-                    ffi.C.kill(old_job.pid, SIGKILL)
-                    ffi.C.waitpid(old_job.pid, nil, 0)
-                end
-            end)
-            pcall(os.remove, old_job.path)
+            self:stopJob(old_job)
             self._inflight[key] = nil
         end
     end
@@ -2565,8 +2589,8 @@ function Reflections:requestSimplify()
         return
     end
     local prompt = self:buildSimplifyPrompt(page.canonical)
-    if not ffi_ok then
-        -- Synchronous fallback (never happens on real devices).
+    if not self:shouldFork() then
+        -- Synchronous fallback (Android never forks: unreliable there).
         local okc, result =
             pcall(Gemini.generate, self:getApiKey(), self:getModelChain(),
                 prompt, 45, 1)
