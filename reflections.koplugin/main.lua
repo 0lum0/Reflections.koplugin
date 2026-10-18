@@ -1129,10 +1129,20 @@ function Reflections:endReadingSession()
         })
         return
     end
-    local cur_idx = Chapters.findChapter(self.ui, "current")
+    local cur_idx, cur_node = Chapters.findChapter(self.ui, "current")
     cur_idx = cur_idx or s.from_idx
     local from_idx, to_idx = s.from_idx, cur_idx
     if from_idx > to_idx then from_idx, to_idx = to_idx, from_idx end
+    -- If the session ends on the very first page of the last chapter, the
+    -- reader hasn't really read it: roll the range back one chapter so its
+    -- (unread) events can't shape the questions.
+    if to_idx == cur_idx and cur_node and cur_node.page
+        and to_idx > from_idx then
+        local pos = Chapters.getCurrentPage(self.ui)
+        if pos - tonumber(cur_node.page) < 1 then
+            to_idx = to_idx - 1
+        end
+    end
     local flat = Chapters.getChapterList(self.ui)
     local from_node, to_node = flat[from_idx], flat[to_idx]
     if not from_node or not to_node then return end
