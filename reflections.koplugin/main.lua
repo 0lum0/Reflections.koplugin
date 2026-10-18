@@ -1049,6 +1049,68 @@ function Reflections:getSessionKey(from_title, to_title)
     return from_title .. " → " .. to_title
 end
 
+-- Manual picker mode: "chapters" or "pages".
+function Reflections:getSessionPickMode()
+    local m = self:readDocSetting("reflections_session_pick_mode")
+    if m == "pages" then return "pages" end
+    return "chapters"
+end
+
+function Reflections:setSessionPickMode(mode)
+    self:saveDocSetting("reflections_session_pick_mode", mode)
+end
+
+-- Page bounds for page-mode sessions; default to everything read so far.
+function Reflections:getSessionPageBound(which)
+    local b = self:readDocSetting("reflections_session_pages")
+    if type(b) == "table" and tonumber(b[which]) then
+        return tonumber(b[which])
+    end
+    if which == "from" then return 1 end
+    return Chapters.getCurrentPage(self.ui)
+end
+
+function Reflections:setSessionPageBound(which, page)
+    local b = self:readDocSetting("reflections_session_pages")
+    if type(b) ~= "table" then b = {} end
+    b[which] = tonumber(page) or 1
+    self:saveDocSetting("reflections_session_pages", b)
+end
+
+function Reflections:editSessionPage(which, on_done)
+    local current = self:getSessionPageBound(which)
+    local max_page = Chapters.getCurrentPage(self.ui)
+    local dialog
+    dialog = InputDialog:new{
+        title = which == "from" and _("From page") or _("To page"),
+        input_hint = "1 to " .. tostring(max_page),
+        input = tostring(current),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        if on_done then on_done() end
+                    end,
+                },
+                {
+                    text = _("OK"),
+                    callback = function()
+                        local n = tonumber(dialog:getInputText())
+                        if n and n >= 1 and n <= max_page then
+                            self:setSessionPageBound(which, math.floor(n))
+                        end
+                        UIManager:close(dialog)
+                        if on_done then on_done() end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+end
+
 -- Last-picked session bounds for this book; default to everything read.
 function Reflections:getSessionBound(which)
     local b = self:readDocSetting("reflections_session")
@@ -1072,13 +1134,14 @@ function Reflections:getPastSessions()
     return s
 end
 
-function Reflections:recordSession(key, from_title, to_title)
+function Reflections:recordSession(key, from_title, to_title, kind)
     local sessions = {}
     for _, s in ipairs(self:getPastSessions()) do
         if s.key ~= key then table.insert(sessions, s) end
     end
     table.insert(sessions, 1, {
         key = key, from = from_title, to = to_title, at = os.time(),
+        kind = kind or "chapters",
     })
     while #sessions > 10 do table.remove(sessions) end
     self:saveDocSetting("reflections_sessions", sessions)
@@ -1210,7 +1273,7 @@ function Reflections:showSessionPicker()
         return
     end
     local progress = self:getProgress()
-    if #progress == 0 then
+    if #progress == 0 and self:getSessionPickMode() ~= "pages" then
         UIManager:show(InfoMessage:new{
             text = _("No finished chapters yet. Read a little first, then come back."),
         })
@@ -1238,35 +1301,85 @@ function Reflections:showSessionPicker()
             text = _("Generate session questions"),
             callback = function()
                 UIManager:close(menu)
-                self:generateForSession(self:getSessionBound("from"),
-                    self:getSessionBound("to"), false)
+                if self:getSessionPickMode() == "pages" then
+                    self:generateForPageSession(
+                        self:getSessionPageBound("from"),
+                        self:getSessionPageBound("to"), false)
+                else
+                    self:generateForSession(self:getSessionBound("from"),
+                        self:getSessionBound("to"), false)
+                end
             end,
         },
         {
+            text_func = function()
+                if self:getSessionPickMode() == "pages" then
+                    return _("Pick by: Pages")
+                end
+                return _("Pick by: Chapters")
+            end,
+            callback = function()
+                UIManager:close(menu)
+                if self:getSessionPickMode() == "pages" then
+                    self:setSessionPickMode("chapters")
+                else
+                    self:setSessionPickMode("pages")
+                end
+                self:showSessionPicker()
+            end,
+        },
+    }
+    if self:getSessionPickMode() == "pages" then
+        table.insert(items, {
+            text_func = function()
+                return _("From page: ")
+                    .. tostring(self:getSessionPageBound("from"))
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:editSessionPage("from", function()
+                    self:showSessionPicker()
+                end)
+            end,
+        })
+        table.insert(items, {
+            text_func = function()
+                return _("To page: ")
+                    .. tostring(self:getSessionPageBound("to"))
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:editSessionPage("to", function()
+                    self:showSessionPicker()
+                end)
+            end,
+        })
+    else
+        table.insert(items, {
             text_func = function()
                 return _("From: ") .. tostring(self:getSessionBound("from"))
             end,
             sub_item_table = chapterChoices("from"),
-        },
-        {
+        })
+        table.insert(items, {
             text_func = function()
                 return _("To: ") .. tostring(self:getSessionBound("to"))
             end,
             sub_item_table = chapterChoices("to"),
-        },
-        {
-            text_func = function()
-                return _("Questions: ")
-                    .. tostring(self:getSessionPromptCount())
-            end,
-            callback = function()
-                UIManager:close(menu)
-                self:editPromptCount("session", function()
-                    self:showSessionPicker()
-                end)
-            end,
-        },
-    }
+        })
+    end
+    table.insert(items, {
+        text_func = function()
+            return _("Questions: ")
+                .. tostring(self:getSessionPromptCount())
+        end,
+        callback = function()
+            UIManager:close(menu)
+            self:editPromptCount("session", function()
+                self:showSessionPicker()
+            end)
+        end,
+    })
     for _, s in ipairs(self:getPastSessions()) do
         local sess = s
         table.insert(items, {
@@ -1274,9 +1387,21 @@ function Reflections:showSessionPicker()
             callback = function()
                 UIManager:close(menu)
                 local cached = self:readCachedPrompts(sess.key)
+                local regen
+                if sess.kind == "pages" then
+                    regen = function()
+                        self:generateForPageSession(sess.from, sess.to, true)
+                    end
+                else
+                    regen = function()
+                        self:generateForSession(sess.from, sess.to, true)
+                    end
+                end
                 if cached then
-                    self:showSessionPrompts(sess.key, sess.from, sess.to, cached,
-                        { from_cache = true })
+                    self:showSessionPrompts(sess.key, sess.from, sess.to,
+                        cached, { from_cache = true, regen = regen })
+                elseif sess.kind == "pages" then
+                    self:generateForPageSession(sess.from, sess.to, false)
                 else
                     self:generateForSession(sess.from, sess.to, false)
                 end
@@ -1329,20 +1454,36 @@ function Reflections:showSessionsScreen()
             callback = function()
                 UIManager:close(menu)
                 local cached = self:readCachedPrompts(sess.key)
+                local regen
+                if sess.kind == "pages" then
+                    regen = function()
+                        self:generateForPageSession(sess.from, sess.to, true)
+                    end
+                else
+                    regen = function()
+                        self:generateForSession(sess.from, sess.to, true)
+                    end
+                end
                 if cached then
                     self:showSessionPrompts(sess.key, sess.from, sess.to,
-                        cached, { from_cache = true })
+                        cached, { from_cache = true, regen = regen })
                 elseif self._inflight[sess.key] then
                     UIManager:show(InfoMessage:new{
                         text = _("Still generating, check back in a moment."),
                     })
+                elseif sess.kind == "pages" then
+                    self:generateForPageSession(sess.from, sess.to, false)
                 else
                     self:generateForSession(sess.from, sess.to, false)
                 end
             end,
             hold_callback = function()
                 UIManager:close(menu)
-                self:generateForSession(sess.from, sess.to, true)
+                if sess.kind == "pages" then
+                    self:generateForPageSession(sess.from, sess.to, true)
+                else
+                    self:generateForSession(sess.from, sess.to, true)
+                end
             end,
         })
     end
@@ -1546,6 +1687,116 @@ function Reflections:generateForSession(from_title, to_title, force)
 end
 
 -- Synchronous fallback used only when fork() is unavailable.
+-- Page-based session questions: like generateForSession but for an explicit
+-- page range instead of chapters. Handy for books without a TOC and for
+-- ranges that don't line up with chapter boundaries.
+function Reflections:generateForPageSession(from_page, to_page, force)
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local max_page = Chapters.getCurrentPage(self.ui)
+    from_page = math.max(1, tonumber(from_page) or 1)
+    to_page = math.min(tonumber(to_page) or max_page, max_page)
+    if from_page > to_page then -- picked backwards: swap rather than complain
+        from_page, to_page = to_page, from_page
+    end
+    local key = "Pages " .. from_page .. "-" .. to_page
+    local from_label, to_label = "page " .. from_page, "page " .. to_page
+    local regen = function()
+        self:generateForPageSession(from_page, to_page, true)
+    end
+    if not force then
+        local cached = self:readCachedPrompts(key)
+        if cached then
+            self:showSessionPrompts(key, from_label, to_label, cached,
+                { from_cache = true, regen = regen })
+            return
+        end
+    end
+
+    -- No fork support (never happens on real devices): synchronous fallback.
+    if not ffi_ok then
+        self:generateForPageSessionSync(key, from_label, to_label,
+            from_page, to_page, regen)
+        return
+    end
+
+    if force then
+        local old_job = self._inflight[key]
+        if old_job then
+            pcall(function()
+                if old_job.pid then
+                    ffi.C.kill(old_job.pid, SIGKILL)
+                    ffi.C.waitpid(old_job.pid, nil, 0)
+                end
+            end)
+            pcall(os.remove, old_job.path)
+            self._inflight[key] = nil
+        end
+    end
+
+    self:showSessionPrompts(key, from_label, to_label,
+        _("Generating your prompts…"), { placeholder = true, regen = regen })
+    self._pending = {
+        title = key,
+        old = self:readCachedPrompts(key),
+        waited = 0,
+        session = true,
+        regen = regen,
+    }
+    local ok, text = pcall(Chapters.getPageRangeText, self.ui,
+        from_page, to_page)
+    if not ok or not text or #text < 50 then
+        self._pending = nil
+        self:showSessionPrompts(key, from_label, to_label,
+            _("Could not extract enough page text."), { regen = regen })
+        return
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt_text = self:buildSessionPrompt(info.title, info.author,
+        from_label, to_label, text, self:getSessionPromptCount(),
+        force and self:readCachedPrompts(key) or nil)
+    self:spawnJob(key, prompt_text, { overwrite = force })
+    self:recordSession(key, from_page, to_page, "pages")
+    self:pollPendingPrompts()
+end
+
+function Reflections:generateForPageSessionSync(key, from_label, to_label,
+    from_page, to_page, regen)
+    local busy = InfoMessage:new{ text = _("Generating reflection prompts...") }
+    UIManager:show(busy)
+    UIManager:forceRePaint()
+
+    local text = Chapters.getPageRangeText(self.ui, from_page, to_page)
+    if not text or #text < 50 then
+        UIManager:close(busy)
+        UIManager:show(InfoMessage:new{
+            text = _("Could not extract enough page text."),
+        })
+        return
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildSessionPrompt(info.title, info.author,
+        from_label, to_label, text, self:getSessionPromptCount())
+    local result, err = Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+    UIManager:close(busy)
+
+    if not result then
+        UIManager:show(InfoMessage:new{
+            text = _("Gemini request failed:\n") .. tostring(err),
+        })
+        return
+    end
+    self:cachePrompts(key, result, false)
+    self:recordSession(key, from_page, to_page, "pages")
+    self:showSessionPrompts(key, from_label, to_label, result,
+        { from_cache = false, regen = regen })
+end
+
 function Reflections:generateForSessionSync(key, from_title, to_title,
     from_idx, to_idx, regen)
     local busy = InfoMessage:new{ text = _("Generating reflection prompts...") }

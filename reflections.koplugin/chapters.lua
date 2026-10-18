@@ -39,17 +39,40 @@ function Chapters.getCurrentPage(ui)
     return 1
 end
 
--- Ordered list of chapter nodes that have page numbers.
+-- Ordered list of chapter nodes that have page numbers. Books without a
+-- table of contents get pseudo-chapters (fixed 50-page chunks up to the
+-- current page) so chapter features keep working.
 function Chapters.getChapterList(ui)
     local ok, raw_toc = pcall(function() return ui.document:getToc() end)
-    if not ok or not raw_toc then return {} end
     local flat = {}
-    for _, node in ipairs(flattenTOC(raw_toc)) do
-        if type(node) == "table" and tonumber(node.page) then
-            table.insert(flat, node)
+    if ok and raw_toc then
+        for _, node in ipairs(flattenTOC(raw_toc)) do
+            if type(node) == "table" and tonumber(node.page) then
+                table.insert(flat, node)
+            end
         end
     end
+    if #flat == 0 then
+        return Chapters.getPseudoChapters(ui)
+    end
     return flat
+end
+
+-- Fallback chapter list for books with no TOC: 50-page chunks.
+function Chapters.getPseudoChapters(ui)
+    local pos = Chapters.getCurrentPage(ui)
+    local size = 50
+    local chunks = {}
+    local n = math.max(1, math.ceil(pos / size))
+    for i = 1, n do
+        local start_p = (i - 1) * size + 1
+        table.insert(chunks, {
+            title = "Pages " .. start_p .. "-" .. (i * size),
+            page = start_p,
+            pseudo = true,
+        })
+    end
+    return chunks
 end
 
 function Chapters.findNodeByTitle(ui, title)
@@ -108,6 +131,35 @@ local function fitBudget(text, max_bytes)
     return head .. "\n\n[...text omitted...]\n\n" .. tail
 end
 
+-- Text for an arbitrary page range, never past the reading position.
+-- Used by page-based sessions.
+function Chapters.getPageRangeText(ui, from_page, to_page, budget)
+    local current_page = Chapters.getCurrentPage(ui)
+    from_page = math.max(1, tonumber(from_page) or 1)
+    to_page = math.min(tonumber(to_page) or current_page, current_page)
+    if from_page > to_page then return "" end
+    local text = ""
+    if ui.rolling and ui.document.getTextFromPositions then
+        local ok, res = pcall(function()
+            return ui.document:getTextFromPositions(from_page, to_page)
+        end)
+        if ok and res then text = res end
+    elseif ui.document.getPageText then
+        local parts = {}
+        for p = from_page, to_page do
+            local ok, t = pcall(function() return ui.document:getPageText(p) end)
+            if ok and t and t ~= "" then table.insert(parts, t) end
+            if #parts > 200 then break end -- sanity cap
+        end
+        text = table.concat(parts, "\n")
+    end
+    text = text:gsub("\r", " ")
+    text = text:gsub("[ \t]+", " ")
+    text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    return fitBudget(text, budget or 60000)
+end
+
 function Chapters.getBookInfo(ui)
     local title, author
     pcall(function()
@@ -127,13 +179,37 @@ function Chapters.getBookInfo(ui)
 end
 
 -- Extract chapter text, never including content past the reader's position.
--- budget caps the returned bytes (default 12000).
+-- budget caps the returned bytes (default 60000): finished chapters go out
+-- whole, so questions can cover the full chapter including the middle.
 function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
     local text = ""
     local is_reflowable = ui.rolling ~= nil
     local current_page = Chapters.getCurrentPage(ui)
 
-    if is_reflowable then
+    if chapter.pseudo then
+        -- No TOC: this "chapter" is a fixed page chunk.
+        local start_p = tonumber(chapter.page) or 1
+        local end_p = (next_chapter and (tonumber(next_chapter.page) - 1))
+            or current_page
+        end_p = math.min(end_p, current_page)
+        end_p = math.max(start_p, end_p)
+        if is_reflowable and ui.document.getTextFromPositions then
+            local ok, res = pcall(function()
+                return ui.document:getTextFromPositions(start_p, end_p)
+            end)
+            if ok and res then text = res end
+        elseif ui.document.getPageText then
+            local parts = {}
+            for p = start_p, end_p do
+                local ok, t = pcall(function()
+                    return ui.document:getPageText(p)
+                end)
+                if ok and t and t ~= "" then table.insert(parts, t) end
+                if #parts > 80 then break end
+            end
+            text = table.concat(parts, "\n")
+        end
+    elseif is_reflowable then
         if ui.document.getTextFromXPointer and chapter.xpointer then
             local ok, res = pcall(function()
                 return ui.document:getTextFromXPointer(chapter.xpointer)
@@ -183,7 +259,7 @@ function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
     text = text:gsub("[ \t]+", " ")
     text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
     text = text:gsub("^%s+", ""):gsub("%s+$", "")
-    return fitBudget(text, budget or 12000)
+    return fitBudget(text, budget or 60000)
 end
 
 -- Index of the chapter with this title in the flattened chapter list.
@@ -198,13 +274,13 @@ end
 -- Spoiler-safe text for a chapter range (a reading session): concatenates
 -- each chapter's text under a chapter header. Only finished chapters should
 -- be included; callers enforce that. per_chapter_budget caps each chapter's
--- contribution (default 8000), total capped at total_budget (default 30000).
--- When cur_idx is given, that chapter is treated as "current" (only text up
--- to the reading position is used); all others are "previous".
+-- contribution (default 20000), total capped at total_budget (default
+-- 100000). When cur_idx is given, that chapter is treated as "current"
+-- (only text up to the reading position is used); all others are "previous".
 function Chapters.getRangeText(ui, from_idx, to_idx, per_chapter_budget,
     total_budget, cur_idx)
-    per_chapter_budget = per_chapter_budget or 8000
-    total_budget = total_budget or 30000
+    per_chapter_budget = per_chapter_budget or 20000
+    total_budget = total_budget or 100000
     local flat = Chapters.getChapterList(ui)
     if #flat == 0 then return "" end
     from_idx = math.max(1, from_idx or 1)
@@ -231,7 +307,7 @@ end
 function Chapters.getWholeBookText(ui)
     local flat = Chapters.getChapterList(ui)
     if #flat == 0 then return "" end
-    return Chapters.getRangeText(ui, 1, #flat, 2000, 50000)
+    return Chapters.getRangeText(ui, 1, #flat, 5000, 150000)
 end
 
 return Chapters
