@@ -39,6 +39,57 @@ function Chapters.getCurrentPage(ui)
     return 1
 end
 
+-- Total page count of the open document (0 when unknown).
+function Chapters.getPageCount(ui)
+    local ok, n = pcall(function()
+        if ui.document and ui.document.getPageCount then
+            return ui.document:getPageCount()
+        end
+    end)
+    if ok and n and tonumber(n) and tonumber(n) > 0 then return tonumber(n) end
+    return 0
+end
+
+-- Text for pages [start_p, end_p] in a reflowable document.
+-- NOTE: ui.document:getTextFromPositions() takes on-screen positions, NOT
+-- page numbers, on real devices, so page boundaries are converted through
+-- getPageXPointer() and read with getTextFromXPointers() instead.
+local function reflowablePageRangeText(ui, start_p, end_p)
+    local doc = ui.document
+    if not (doc and doc.getPageXPointer and doc.getTextFromXPointers) then
+        return nil
+    end
+    local page_count = Chapters.getPageCount(ui)
+    local ok0, xp0 = pcall(function() return doc:getPageXPointer(start_p) end)
+    if not ok0 or type(xp0) ~= "string" or xp0 == "" then return nil end
+    -- The range end is exclusive: use the start of the page after end_p.
+    -- When end_p is the last page, end at the live reading position instead
+    -- (callers guarantee end_p never passes the reading position then).
+    local xp1
+    if page_count > 0 and end_p < page_count then
+        local ok1, x = pcall(function()
+            return doc:getPageXPointer(end_p + 1)
+        end)
+        if ok1 and type(x) == "string" and x ~= "" then xp1 = x end
+    end
+    if not xp1 and doc.getXPointer then
+        -- end_p is the last page: end at the live reading position. Only
+        -- valid when the range actually reaches the reader (end_p <= now);
+        -- otherwise bail instead of returning a swapped range.
+        local now = Chapters.getCurrentPage(ui)
+        if end_p <= now then
+            local okc, xc = pcall(function() return doc:getXPointer() end)
+            if okc and type(xc) == "string" and xc ~= "" then xp1 = xc end
+        end
+    end
+    if not xp1 then return nil end
+    local ok, res = pcall(function()
+        return doc:getTextFromXPointers(xp0, xp1)
+    end)
+    if ok and type(res) == "string" and #res > 0 then return res end
+    return nil
+end
+
 -- Ordered list of chapter nodes that have page numbers. Books without a
 -- table of contents get pseudo-chapters (fixed 50-page chunks up to the
 -- current page) so chapter features keep working.
@@ -139,11 +190,9 @@ function Chapters.getPageRangeText(ui, from_page, to_page, budget)
     to_page = math.min(tonumber(to_page) or current_page, current_page)
     if from_page > to_page then return "" end
     local text = ""
-    if ui.rolling and ui.document.getTextFromPositions then
-        local ok, res = pcall(function()
-            return ui.document:getTextFromPositions(from_page, to_page)
-        end)
-        if ok and res then text = res end
+    if ui.rolling then
+        local t = reflowablePageRangeText(ui, from_page, to_page)
+        if t then text = t end
     elseif ui.document.getPageText then
         local parts = {}
         for p = from_page, to_page do
@@ -179,7 +228,7 @@ function Chapters.getBookInfo(ui)
 end
 
 -- Extract chapter text, never including content past the reader's position.
--- budget caps the returned bytes (default 60000): finished chapters go out
+-- budget caps the returned bytes (default 500000): finished chapters go out
 -- whole, so questions can cover the full chapter including the middle.
 function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
     local text = ""
@@ -193,11 +242,9 @@ function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
             or current_page
         end_p = math.min(end_p, current_page)
         end_p = math.max(start_p, end_p)
-        if is_reflowable and ui.document.getTextFromPositions then
-            local ok, res = pcall(function()
-                return ui.document:getTextFromPositions(start_p, end_p)
-            end)
-            if ok and res then text = res end
+        if is_reflowable then
+            local t = reflowablePageRangeText(ui, start_p, end_p)
+            if t then text = t end
         elseif ui.document.getPageText then
             local parts = {}
             for p = start_p, end_p do
@@ -210,28 +257,43 @@ function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
             text = table.concat(parts, "\n")
         end
     elseif is_reflowable then
-        if ui.document.getTextFromXPointer and chapter.xpointer then
+        -- Page-range extraction: a chapter's pages run from its TOC start
+        -- page to the next chapter's start page. This spans split files and
+        -- part layouts whose full text the TOC entry alone cannot see.
+        local start_p = tonumber(chapter.page) or 1
+        local end_p
+        if which == "current" then
+            -- Spoiler guard: never past the reading position.
+            end_p = current_page
+        else
+            end_p = (next_chapter and (tonumber(next_chapter.page) - 1))
+                or Chapters.getPageCount(ui)
+        end
+        if end_p <= 0 then end_p = current_page end
+        end_p = math.max(start_p, end_p)
+        local t = reflowablePageRangeText(ui, start_p, end_p)
+        if t then
+            text = t
+        elseif ui.document.getTextFromXPointer and chapter.xpointer then
+            -- Fallback for documents without page-xpointer support: the
+            -- chapter entry's own text (the pre-v38 behavior).
             local ok, res = pcall(function()
                 return ui.document:getTextFromXPointer(chapter.xpointer)
             end)
-            if ok and res and #res > 100 then text = res end
-        end
-        if #text < 100 and ui.document.getTextFromPositions then
-            local ok, res = pcall(function()
-                return ui.document:getTextFromPositions(current_page, current_page + 200)
-            end)
-            if ok and res and #res > 100 then text = res end
-        end
-        -- Spoiler guard: for the chapter being read, keep only the fraction
-        -- of the text corresponding to the fraction of the chapter read.
-        if which == "current" and #text > 0 then
-            local start_p = tonumber(chapter.page) or 1
-            local end_p = (next_chapter and tonumber(next_chapter.page))
-                or (current_page + 40)
-            if end_p > start_p then
-                local frac = (current_page - start_p + 1) / (end_p - start_p)
-                frac = math.max(0.05, math.min(1, frac))
-                text = safeByteCut(text, math.floor(#text * frac))
+            if ok and type(res) == "string" and #res > 100 then
+                text = res
+                -- Spoiler guard for the chapter being read (pre-v38 cut).
+                if which == "current" then
+                    local c_start = tonumber(chapter.page) or 1
+                    local c_end = (next_chapter and tonumber(next_chapter.page))
+                        or (current_page + 40)
+                    if c_end > c_start then
+                        local frac = (current_page - c_start + 1)
+                            / (c_end - c_start)
+                        frac = math.max(0.05, math.min(1, frac))
+                        text = safeByteCut(text, math.floor(#text * frac))
+                    end
+                end
             end
         end
     else
@@ -259,7 +321,7 @@ function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
     text = text:gsub("[ \t]+", " ")
     text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
     text = text:gsub("^%s+", ""):gsub("%s+$", "")
-    return fitBudget(text, budget or 60000)
+    return fitBudget(text, budget or 500000)
 end
 
 -- Index of the chapter with this title in the flattened chapter list.
