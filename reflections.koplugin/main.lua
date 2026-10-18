@@ -429,11 +429,14 @@ function Reflections:cachePrompts(chapter_title, prompts, partial)
 end
 
 -- Forget every cached prompt for the current book.
-function Reflections:clearCache()
+function Reflections:clearCache(keep_sessions)
     local ds = self:getDocStore()
     if not ds then return end
     pcall(function()
         ds:delSetting("reflections_cache")
+        if not keep_sessions then
+            ds:delSetting("reflections_sessions")
+        end
         if ds.flush then ds:flush() end
     end)
 end
@@ -1414,18 +1417,34 @@ function Reflections:showSettingsScreen()
             end,
         },
         {
-            text = _("Clear cached prompts"),
+            text = _("Clear cached reflections"),
             callback = function()
                 local ConfirmBox = require("ui/widget/confirmbox")
-                UIManager:show(ConfirmBox:new{
-                    text = _("This will delete all generated reflections for this book: chapter prompts, session questions, and the book reflection.\n\nHit OK to proceed."),
+                local CheckButton = require("ui/widget/checkbutton")
+                local Screen = require("device").screen
+                local keep_sessions = false
+                local check = CheckButton:new{
+                    text = _("Keep previous sessions"),
+                    checked = false,
+                    -- Explicit width: CheckButton has no parent at
+                    -- construction time to measure against, so without
+                    -- this it crashes (checkbutton.lua).
+                    width = Screen:scaleBySize(300),
+                    callback = function()
+                        keep_sessions = not keep_sessions
+                    end,
+                }
+                local dialog = ConfirmBox:new{
+                    text = _("This will delete all generated reflections for this book: chapter prompts, session questions, and the book reflection.\n\nYour previous sessions list will be deleted too, unless you keep it below.\n\nHit OK to proceed."),
                     ok_text = _("OK"),
                     ok_callback = function()
-                        self:clearCache()
+                        self:clearCache(keep_sessions)
                         UIManager:close(menu)
                         self:showSettingsScreen()
                     end,
-                })
+                }
+                dialog:addWidget(check)
+                UIManager:show(dialog)
             end,
         },
         {
@@ -1576,7 +1595,7 @@ end
 
 -- One set of big-picture questions about the whole work, for when the
 -- reader finishes the book: a closing ritual. Cached per book under its
--- own key (cleared with everything else by "Clear cached prompts");
+-- own key (cleared with everything else by "Clear cached reflections");
 -- "New prompts" regenerates.
 
 function Reflections:getBookReflectionKey()
