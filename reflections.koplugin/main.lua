@@ -401,7 +401,50 @@ end
 
 -- Prompts cache: title -> { text=..., partial=bool }. Plain strings from
 -- v1 are still honored.
+--
+-- Global generations: "clear for all books" bumps a counter in
+-- G_reader_settings instead of touching every book's file. Per-book data
+-- tagged with an older generation reads as empty and is deleted lazily.
+function Reflections:getCacheGeneration()
+    return G_reader_settings:readSetting("reflections_cache_generation") or 0
+end
+
+function Reflections:getSessionsGeneration()
+    return G_reader_settings:readSetting("reflections_sessions_generation") or 0
+end
+
+-- True when this book's cached prompts belong to the current generation.
+function Reflections:isCacheValid()
+    local gen = self:readDocSetting("reflections_cache_gen") or 0
+    if gen == self:getCacheGeneration() then return true end
+    local ds = self:getDocStore()
+    pcall(function()
+        if ds then
+            ds:delSetting("reflections_cache")
+            ds:delSetting("reflections_cache_gen")
+            if ds.flush then ds:flush() end
+        end
+    end)
+    return false
+end
+
+-- True when this book's sessions list belongs to the current generation.
+function Reflections:isSessionsValid()
+    local gen = self:readDocSetting("reflections_sessions_gen") or 0
+    if gen == self:getSessionsGeneration() then return true end
+    local ds = self:getDocStore()
+    pcall(function()
+        if ds then
+            ds:delSetting("reflections_sessions")
+            ds:delSetting("reflections_sessions_gen")
+            if ds.flush then ds:flush() end
+        end
+    end)
+    return false
+end
+
 function Reflections:readCachedPrompts(chapter_title)
+    if not self:isCacheValid() then return nil end
     local cache = self:readDocSetting("reflections_cache")
     if type(cache) ~= "table" then return nil end
     local entry = cache[chapter_title]
@@ -411,6 +454,7 @@ function Reflections:readCachedPrompts(chapter_title)
 end
 
 function Reflections:isPartialCache(chapter_title)
+    if not self:isCacheValid() then return false end
     local cache = self:readDocSetting("reflections_cache")
     if type(cache) ~= "table" then return false end
     local entry = cache[chapter_title]
@@ -424,6 +468,7 @@ function Reflections:cachePrompts(chapter_title, prompts, partial)
         local cache = ds:readSetting("reflections_cache") or {}
         cache[chapter_title] = { text = prompts, partial = partial and true or false }
         ds:saveSetting("reflections_cache", cache)
+        ds:saveSetting("reflections_cache_gen", self:getCacheGeneration())
         if ds.flush then ds:flush() end
     end)
 end
@@ -438,6 +483,20 @@ function Reflections:clearCache(keep_sessions)
             ds:delSetting("reflections_sessions")
         end
         if ds.flush then ds:flush() end
+    end)
+end
+
+-- Forget cached prompts (and optionally sessions) for ALL books by bumping
+-- the global generations; per-book data from older generations reads empty.
+function Reflections:clearAllCaches(keep_sessions)
+    pcall(function()
+        G_reader_settings:saveSetting("reflections_cache_generation",
+            self:getCacheGeneration() + 1)
+        if not keep_sessions then
+            G_reader_settings:saveSetting("reflections_sessions_generation",
+                self:getSessionsGeneration() + 1)
+        end
+        if G_reader_settings.flush then G_reader_settings:flush() end
     end)
 end
 
@@ -1142,6 +1201,7 @@ function Reflections:setSessionBound(which, title)
 end
 
 function Reflections:getPastSessions()
+    if not self:isSessionsValid() then return {} end
     local s = self:readDocSetting("reflections_sessions")
     if type(s) ~= "table" then return {} end
     return s
@@ -1158,6 +1218,7 @@ function Reflections:recordSession(key, from_title, to_title, kind)
     })
     while #sessions > 10 do table.remove(sessions) end
     self:saveDocSetting("reflections_sessions", sessions)
+    self:saveDocSetting("reflections_sessions_gen", self:getSessionsGeneration())
 end
 
 -- The currently active tracked reading session, if one was begun.
@@ -1593,6 +1654,37 @@ function Reflections:showSettingsScreen()
                     ok_text = _("OK"),
                     ok_callback = function()
                         self:clearCache(keep_sessions)
+                        UIManager:close(menu)
+                        self:showSettingsScreen()
+                    end,
+                }
+                dialog:addWidget(check)
+                UIManager:show(dialog)
+            end,
+        },
+        {
+            text = _("Clear cached reflections (all books)"),
+            callback = function()
+                local ConfirmBox = require("ui/widget/confirmbox")
+                local CheckButton = require("ui/widget/checkbutton")
+                local Screen = require("device").screen
+                local keep_sessions = false
+                local check = CheckButton:new{
+                    text = _("Keep previous sessions"),
+                    checked = false,
+                    -- Explicit width: CheckButton has no parent at
+                    -- construction time to measure against, so without
+                    -- this it crashes (checkbutton.lua).
+                    width = Screen:scaleBySize(300),
+                    callback = function()
+                        keep_sessions = not keep_sessions
+                    end,
+                }
+                local dialog = ConfirmBox:new{
+                    text = _("This will delete all generated reflections for EVERY book: chapter prompts, session questions, and book reflections.\n\nPrevious sessions lists will be deleted too, unless you keep them below.\n\nHit OK to proceed."),
+                    ok_text = _("OK"),
+                    ok_callback = function()
+                        self:clearAllCaches(keep_sessions)
                         UIManager:close(menu)
                         self:showSettingsScreen()
                     end,
