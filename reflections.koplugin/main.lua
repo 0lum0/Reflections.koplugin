@@ -51,9 +51,33 @@ function Reflections:init()
     self._pending = nil     -- foreground tap currently waiting on a job
     self._open_prompts = nil -- currently shown prompts page, if any
     self:migrateFileConfig()
+    self:pinToTopOfToolsMenu()
     if self.ui and self.ui.menu and self.ui.menu.registerToMainMenu then
         self.ui.menu:registerToMainMenu(self)
     end
+end
+
+-- Put Reflections at the top of the Tools menu (first page). KOReader
+-- appends unknown plugins to the end via sorting_hint; instead we edit the
+-- cached menu order directly, the same trick xray.koplugin uses.
+function Reflections:pinToTopOfToolsMenu()
+    pcall(function()
+        local ok_order, reader_menu_order =
+            pcall(require, "ui/elements/reader_menu_order")
+        if not ok_order then
+            ok_order, reader_menu_order =
+                pcall(require, "apps/reader/modules/readermenuorder")
+        end
+        if ok_order and reader_menu_order and reader_menu_order.tools then
+            for i, v in ipairs(reader_menu_order.tools) do
+                if v == "reflections" then
+                    table.remove(reader_menu_order.tools, i)
+                    break
+                end
+            end
+            table.insert(reader_menu_order.tools, 1, "reflections")
+        end
+    end)
 end
 
 -- The plugin folder (including reflections.conf.lua) is replaced wholesale
@@ -1380,6 +1404,21 @@ function Reflections:showSettingsScreen()
             end,
         },
         {
+            text = _("Clear cached prompts"),
+            callback = function()
+                local ConfirmBox = require("ui/widget/confirmbox")
+                UIManager:show(ConfirmBox:new{
+                    text = _("This will delete all generated reflections for this book: chapter prompts, session questions, and the book reflection.\n\nHit OK to proceed."),
+                    ok_text = _("OK"),
+                    ok_callback = function()
+                        self:clearCache()
+                        UIManager:close(menu)
+                        self:showSettingsScreen()
+                    end,
+                })
+            end,
+        },
+        {
             text = _("Close"),
             callback = function() UIManager:close(menu) end,
         },
@@ -1924,6 +1963,9 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
         from_cache = opt
     end
 
+    -- Normalize once: blank line between numbered questions.
+    prompts = self:normalizeSpacing(prompts)
+
     -- Per-page simplify state. Rebuilding the same page (placeholder swaps,
     -- simplify toggles) keeps it; opening a different page starts fresh.
     local prev = self._open_prompts
@@ -1985,6 +2027,12 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
         text_h = Screen:scaleBySize(100)
     end
 
+    -- Explicit width for the Simplify toggle: CheckButton has no parent
+    -- at construction time to measure against, so without this it
+    -- crashes (checkbutton.lua). The row is centered, so extra space
+    -- is harmless.
+    local toggle_w = Screen:scaleBySize(200)
+
     local body
     if placeholder or auto_simplify then
         -- auto_simplify shows its own status line while the reword runs
@@ -2045,6 +2093,10 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
                 CheckButton:new{
                     text = _("Simplify"),
                     checked = page.simplify_on,
+                    -- Explicit width: CheckButton has no parent at
+                    -- construction time to measure against, so without
+                    -- this it crashes (checkbutton.lua).
+                    width = toggle_w,
                     callback = function() self:toggleSimplify() end,
                 },
                 HorizontalSpan:new{ width = pad },
@@ -2066,6 +2118,16 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
 end
 
 -- ---------------------------------------------------------------- simplify
+
+-- Blank line between numbered questions. The model sometimes returns them
+-- single-spaced (notably session prompts); display reads better
+-- double-spaced, so enforce it everywhere, including saved prompts.
+function Reflections:normalizeSpacing(text)
+    if type(text) ~= "string" or text == "" then return text end
+    local t = text:gsub("\n\n\n+", "\n\n")
+    t = t:gsub("([^\n])\n(%d+[%.%)]%s)", "%1\n\n%2")
+    return t
+end
 
 -- Build the reword prompt: the same questions, lighter and more relaxed.
 -- Never dumbs them down, just easier to sit with.
@@ -2195,99 +2257,6 @@ function Reflections:showMainScreen()
         end,
     })
     table.insert(items, {
-        text = _("Session questions…"),
-        callback = function()
-            UIManager:close(menu)
-            self:showSessionPicker()
-        end,
-    })
-    table.insert(items, {
-        text = _("End of book reflection…"),
-        callback = function()
-            UIManager:close(menu)
-            self:showBookPicker()
-        end,
-    })
-    table.insert(items, {
-        text_func = function()
-            if self:isNonfiction() then
-                return _("Mode: Nonfiction")
-            end
-            return _("Mode: Fiction")
-        end,
-        callback = function()
-            self:setNonfiction(not self:isNonfiction())
-            UIManager:close(menu)
-            self:showMainScreen()
-        end,
-    })
-    table.insert(items, {
-        text = _("Settings"),
-        sub_item_table = {
-            {
-                text_func = function()
-                    local k = self:getApiKey()
-                    if k ~= "" then
-                        -- Fingerprint, not the key: enough to spot a typo.
-                        local fp = k:sub(1, 6) .. "..." .. k:sub(-4)
-                            .. " (" .. #k .. " chars)"
-                        return _("Gemini API key: set [") .. fp .. "]"
-                    end
-                    return _("Gemini API key: missing")
-                end,
-                callback = function() self:editApiKey() end,
-            },
-            {
-                text_func = function()
-                    return _("Prompts per chapter: ")
-                        .. tostring(self:getPromptCount())
-                end,
-                callback = function() self:editPromptCount("chapter") end,
-            },
-            {
-                text_func = function()
-                    return _("Model: ") .. self:getModel()
-                end,
-                callback = function() self:editModel() end,
-            },
-            {
-                text_func = function()
-                    if self:getBackgroundEnabled() then
-                        return _("Generate in background: on")
-                    end
-                    return _("Generate in background: off")
-                end,
-                callback = function()
-                    G_reader_settings:saveSetting(
-                        "reflections_background", not self:getBackgroundEnabled())
-                end,
-            },
-        },
-    })
-    table.insert(items, {
-        text = _("Clear cached prompts"),
-        callback = function()
-            local ConfirmBox = require("ui/widget/confirmbox")
-            UIManager:show(ConfirmBox:new{
-                text = _("Delete all cached prompts for this book?\nYou can generate fresh ones afterwards."),
-                ok_text = _("Delete"),
-                ok_callback = function()
-                    self:clearCache()
-                    UIManager:close(menu)
-                    self:showMainScreen()
-                end,
-            })
-        end,
-    })
-    table.insert(items, {
-        text = _("Tip: hold a chapter for fresh prompts"),
-        callback = function()
-            UIManager:show(InfoMessage:new{
-                text = _("Tap a chapter to read its prompts.\nHold a chapter to generate a new set."),
-            })
-        end,
-    })
-    table.insert(items, {
         text = _("Close"),
         callback = function() UIManager:close(menu) end,
     })
@@ -2298,8 +2267,7 @@ function Reflections:showMainScreen()
         is_popout = false,
         is_borderless = true,
     }
-    -- Start on the last page: the latest chapters and the settings entries
-    -- live there, so the reader lands where they left off.
+    -- Start on the last page: the reader lands on the latest chapters.
     menu:switchItemTable(nil, nil, #items)
     UIManager:show(menu)
 end
@@ -2332,6 +2300,10 @@ function Reflections:getSubMenuItems()
             callback = function() self:showSessionsScreen() end,
         },
         {
+            text = _("End of book reflection…"),
+            callback = function() self:showBookPicker() end,
+        },
+        {
             text = toggle_text,
             callback = function()
                 if self:getActiveSession() then
@@ -2339,6 +2311,17 @@ function Reflections:getSubMenuItems()
                 else
                     self:beginReadingSession()
                 end
+            end,
+        },
+        {
+            text_func = function()
+                if self:isNonfiction() then
+                    return _("Mode: Nonfiction")
+                end
+                return _("Mode: Fiction")
+            end,
+            callback = function()
+                self:setNonfiction(not self:isNonfiction())
             end,
         },
         {
