@@ -317,6 +317,11 @@ function Reflections:getProviderLabel()
     return providerById(self:getProviderId()).label
 end
 
+function Reflections:requestFailedText(err)
+    return self:getProviderLabel() .. " request failed:\n"
+        .. tostring(err)
+end
+
 -- The Gemini key: device setting, then the preconfigured file value.
 function Reflections:getGeminiKey()
     local v
@@ -1575,7 +1580,7 @@ function Reflections:generateForChapterSync(chapter_title, node, next_node, kind
 
     if not result then
         UIManager:show(InfoMessage:new{
-            text = _("Gemini request failed:\n") .. tostring(err),
+            text = self:requestFailedText(err),
         })
         return
     end
@@ -2517,7 +2522,7 @@ function Reflections:generateForPageSessionSync(key, from_label, to_label,
 
     if not result then
         UIManager:show(InfoMessage:new{
-            text = _("Gemini request failed:\n") .. tostring(err),
+            text = self:requestFailedText(err),
         })
         return
     end
@@ -2549,7 +2554,7 @@ function Reflections:generateForSessionSync(key, from_title, to_title,
 
     if not result then
         UIManager:show(InfoMessage:new{
-            text = _("Gemini request failed:\n") .. tostring(err),
+            text = self:requestFailedText(err),
         })
         return
     end
@@ -2844,7 +2849,7 @@ function Reflections:generateForBookSync(key, page_title, regen)
 
     if not result then
         UIManager:show(InfoMessage:new{
-            text = _("Gemini request failed:\n") .. tostring(err),
+            text = self:requestFailedText(err),
         })
         return
     end
@@ -3026,7 +3031,7 @@ function Reflections:pollPendingPrompts()
                     text = _("Session prompts failed: ") .. tostring(err),
                 })
             else
-                showIt(_("Gemini request failed: ") .. tostring(err),
+                showIt(self:getProviderLabel() .. " request failed: " .. tostring(err),
                     { is_error = true })
             end
             return
@@ -3050,7 +3055,7 @@ function Reflections:pollPendingPrompts()
                     text = _("Session prompts are taking too long. Check your connection and try again."),
                 })
             else
-                showIt(_("Gemini is taking too long. Check your connection and try again."),
+                showIt(_(self:getProviderLabel() .. " is taking too long. Check your connection and try again."),
                     { is_error = true })
             end
             return
@@ -3606,14 +3611,14 @@ function Reflections:swapQuestion(idx)
     UIManager:close(busy)
     if not result then
         UIManager:show(InfoMessage:new{
-            text = _("Gemini request failed:\n") .. tostring(err),
+            text = self:requestFailedText(err),
         })
         return
     end
     local fresh = self:splitQuestions(result)
     if #fresh == 0 then
         UIManager:show(InfoMessage:new{
-            text = _("Gemini request failed:\nno usable question came back"),
+            text = self:requestFailedText("no usable question came back"),
         })
         return
     end
@@ -3989,7 +3994,7 @@ function Reflections:generateForHighlightsSync(scope, hl_key, hl_title,
 
     if not result then
         UIManager:show(InfoMessage:new{
-            text = _("Gemini request failed:\n") .. tostring(err),
+            text = self:requestFailedText(err),
         })
         return
     end

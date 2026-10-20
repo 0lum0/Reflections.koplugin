@@ -199,6 +199,19 @@ end
 -- bearer key, and a model id, carried in a config table:
 -- { kind = "openai", label, api_key, model, base_url, extra_headers }.
 
+-- Reasoning tokens and the visible answer share one completion budget.
+-- A flat 1024 leaves heavier reasoning levels nothing to answer with, so
+-- the cap rises with the requested level. Auto gets the largest cap too:
+-- the provider chooses the effort, and some defaults are heavy. Off
+-- keeps the original budget.
+local function openai_max_tokens(level)
+    if level == "low" then return 2048 end
+    if level == "medium" then return 8192 end
+    if level == "high" then return 8192 end
+    if level == "auto" then return 8192 end
+    return 1024
+end
+
 -- Pure builder, split out so tests can exercise it without a network.
 function Gemini._buildOpenAIRequest(config, prompt_text)
     local headers = {
@@ -212,7 +225,7 @@ function Gemini._buildOpenAIRequest(config, prompt_text)
         model = config.model,
         messages = { { role = "user", content = prompt_text } },
         temperature = 0.7,
-        max_tokens = 1024,
+        max_tokens = openai_max_tokens(config.reasoning),
     }
     -- Reasoning control, for the heavier models that would otherwise
     -- spend the whole output budget thinking and return nothing. Each
@@ -267,11 +280,17 @@ function Gemini._parseOpenAI(response_text)
         return nil, tostring(msg or "unknown error")
     end
     local choices = data.choices
-    if choices and choices[1] and choices[1].message
-        and type(choices[1].message.content) == "string" then
-        local t = choices[1].message.content
+    local choice = choices and choices[1] or nil
+    if choice and choice.message
+        and type(choice.message.content) == "string" then
+        local t = choice.message.content
             :gsub("^%s+", ""):gsub("%s+$", "")
         if t ~= "" then return t end
+    end
+    if choice and choice.finish_reason == "length" then
+        return nil, "the model used its whole answer budget before "
+            .. "writing any questions. A lower Reasoning setting "
+            .. "usually fixes this."
     end
     return nil, "the provider returned an empty response"
 end
