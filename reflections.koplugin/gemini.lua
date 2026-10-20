@@ -250,7 +250,18 @@ function Gemini._buildOpenAIRequest(config, prompt_text)
                     clear_thinking = true,
                 }
             else
-                payload.reasoning_effort = level
+                local eff = level
+                -- GLM's real levels are low, high, and max, and it
+                -- treats "medium" as max: thinking with no ceiling,
+                -- which can spend the whole answer budget and return
+                -- nothing. Medium on a GLM model therefore sends
+                -- high, its heaviest bounded level.
+                if level == "medium"
+                    and tostring(config.model or ""):lower()
+                        :find("glm", 1, true) then
+                    eff = "high"
+                end
+                payload.reasoning_effort = eff
                 payload.chat_template_kwargs = { clear_thinking = true }
             end
         elseif config.provider_id == "openai"
