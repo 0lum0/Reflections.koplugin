@@ -27,26 +27,10 @@ local function is_transient(code)
     return code == nil or code == 429 or code == 500 or code == 502 or code == 503
 end
 
--- One attempt. Returns the text, or (nil, error message, http code).
-function Gemini._request(api_key, model, prompt_text, timeout)
-    local url = "https://generativelanguage.googleapis.com/v1beta/models/"
-        .. model .. ":generateContent"
-
-    local body = JSON.encode({
-        contents = {
-            { parts = { { text = prompt_text } } },
-        },
-        generationConfig = {
-            temperature = 0.7,
-            maxOutputTokens = 1024,
-        },
-    })
-
-    local headers = {
-        ["Content-Type"] = "application/json",
-        ["x-goog-api-key"] = api_key,
-    }
-
+-- One raw POST of a JSON body over whichever transport this KOReader
+-- build supports. Returns (response_text, http_code), or
+-- (nil, error_message) when every transport failed.
+local function http_post(url, headers, body, timeout)
     local ltn12 = require("ltn12")
     local socketutil = require("socketutil")
     pcall(function() socketutil:set_timeout(timeout, timeout) end)
@@ -103,15 +87,56 @@ function Gemini._request(api_key, model, prompt_text, timeout)
     end
     pcall(function() socketutil:reset_timeout() end)
     if not ok then
-        -- Every transport failed: no usable HTTP code.
         return nil, "request failed: " .. tostring(fail_detail)
     end
+    return table.concat(response_body), code
+end
 
-    local response_text = table.concat(response_body)
+-- Maps a reasoning level to a Gemini thinking budget in tokens.
+-- Auto (and anything unknown) returns nil: no thinkingConfig is sent
+-- and the model thinks exactly as much as it decides on its own.
+function Gemini._thinkingBudget(level)
+    if level == "off" then return 0 end
+    if level == "low" then return 512 end
+    if level == "medium" then return 2048 end
+    if level == "high" then return 8192 end
+    return nil
+end
+
+-- One Gemini attempt. Returns the text, or (nil, error message, http code).
+function Gemini._request(api_key, model, prompt_text, timeout,
+    thinking_budget)
+    local url = "https://generativelanguage.googleapis.com/v1beta/models/"
+        .. model .. ":generateContent"
+
+    local gen_config = {
+        temperature = 0.7,
+        maxOutputTokens = 1024,
+    }
+    if thinking_budget ~= nil then
+        gen_config.thinkingConfig = { thinkingBudget = thinking_budget }
+    end
+    local body = JSON.encode({
+        contents = {
+            { parts = { { text = prompt_text } } },
+        },
+        generationConfig = gen_config,
+    })
+
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["x-goog-api-key"] = api_key,
+    }
+
+    local response_text, code = http_post(url, headers, body, timeout)
+    if response_text == nil then
+        -- Every transport failed: no usable HTTP code.
+        return nil, code
+    end
     code = tonumber(code) or 0
-    if not ok or code < 200 or code >= 300 then
+    if code < 200 or code >= 300 then
         if code == 401 then
-            return nil, "Gemini rejected the API key. Check it in Tools > Reflections > Settings > Gemini API key.", code
+            return nil, "Gemini rejected the API key. Check it in Tools > Reflections > Settings > API key.", code
         end
         local detail = response_text:sub(1, 300)
         if detail == "" then detail = "no response body" end
@@ -140,14 +165,16 @@ end
 -- 503, network blips) are retried per model; a 404 (retired model) skips to
 -- the next model immediately; other errors fail fast. max_retries counts the
 -- extra attempts per model after the first (default 1).
-function Gemini.generate(api_key, model, prompt_text, timeout, max_retries)
+function Gemini.generate(api_key, model, prompt_text, timeout, max_retries,
+    thinking_budget)
     timeout = timeout or 60
     if max_retries == nil then max_retries = 1 end
     local models = type(model) == "table" and model or { model }
     local last_err
     for _, m in ipairs(models) do
         for attempt = 0, max_retries do
-            local text, err, code = Gemini._request(api_key, m, prompt_text, timeout)
+            local text, err, code = Gemini._request(api_key, m,
+                prompt_text, timeout, thinking_budget)
             if text then return text end
             last_err = err
             if code == 404 then
@@ -163,6 +190,156 @@ function Gemini.generate(api_key, model, prompt_text, timeout, max_retries)
         end
     end
     return nil, last_err
+end
+
+-- ------------------------------------------------- OpenAI-compatible APIs
+-- OpenAI, DeepSeek, OpenRouter, and most other providers (plus local
+-- model servers) all speak the same chat completions format, so one
+-- client covers the whole family. A provider is just a base URL, a
+-- bearer key, and a model id, carried in a config table:
+-- { kind = "openai", label, api_key, model, base_url, extra_headers }.
+
+-- Pure builder, split out so tests can exercise it without a network.
+function Gemini._buildOpenAIRequest(config, prompt_text)
+    local headers = {
+        ["Content-Type"] = "application/json",
+        ["Authorization"] = "Bearer " .. tostring(config.api_key or ""),
+    }
+    if type(config.extra_headers) == "table" then
+        for k, v in pairs(config.extra_headers) do headers[k] = v end
+    end
+    local payload = {
+        model = config.model,
+        messages = { { role = "user", content = prompt_text } },
+        temperature = 0.7,
+        max_tokens = 1024,
+    }
+    -- Reasoning control, for the heavier models that would otherwise
+    -- spend the whole output budget thinking and return nothing. Each
+    -- provider family takes its own field; Auto sends nothing, and
+    -- providers with no standard control ignore the setting.
+    local level = config.reasoning
+    if level == "off" or level == "low" or level == "medium"
+        or level == "high" then
+        if config.provider_id == "openrouter" then
+            payload.reasoning = {
+                effort = level == "off" and "none" or level,
+            }
+        elseif config.provider_id == "nvidia" then
+            -- NIM serves many model families behind one endpoint, and
+            -- its reasoning controls are the vLLM style ones: the GLM
+            -- and gpt-oss families take reasoning_effort, thinking is
+            -- switched off through the chat template, and NVIDIA's own
+            -- GLM notes ask chat callers to pass clear_thinking.
+            if level == "off" then
+                payload.chat_template_kwargs = {
+                    enable_thinking = false,
+                    clear_thinking = true,
+                }
+            else
+                payload.reasoning_effort = level
+                payload.chat_template_kwargs = { clear_thinking = true }
+            end
+        elseif config.provider_id == "openai"
+            or config.provider_id == "anthropic"
+            or config.provider_id == "groq"
+            or config.provider_id == "xai" then
+            if level ~= "off" then
+                payload.reasoning_effort = level
+            end
+        end
+    end
+    local body = JSON.encode(payload)
+    local base = tostring(config.base_url or ""):gsub("/+$", "")
+    return base .. "/chat/completions", headers, body
+end
+
+-- Pure parser for a chat completions response body. Returns the text,
+-- or (nil, error message).
+function Gemini._parseOpenAI(response_text)
+    local ok_json, data = pcall(JSON.decode, response_text)
+    if not ok_json or type(data) ~= "table" then
+        return nil, "could not understand the provider's response"
+    end
+    if data.error then
+        local msg = type(data.error) == "table" and data.error.message
+            or tostring(data.error)
+        return nil, tostring(msg or "unknown error")
+    end
+    local choices = data.choices
+    if choices and choices[1] and choices[1].message
+        and type(choices[1].message.content) == "string" then
+        local t = choices[1].message.content
+            :gsub("^%s+", ""):gsub("%s+$", "")
+        if t ~= "" then return t end
+    end
+    return nil, "the provider returned an empty response"
+end
+
+-- One OpenAI-compatible attempt. Returns the text, or
+-- (nil, error message, http code).
+function Gemini._requestOpenAI(config, prompt_text, timeout)
+    local url, headers, body =
+        Gemini._buildOpenAIRequest(config, prompt_text)
+    local response_text, code = http_post(url, headers, body, timeout)
+    if response_text == nil then
+        return nil, code
+    end
+    code = tonumber(code) or 0
+    if code < 200 or code >= 300 then
+        if code == 401 or code == 403 then
+            return nil, tostring(config.label or "The provider")
+                .. " rejected the API key. Check it in Tools > "
+                .. "Reflections > Settings > API key.", code
+        end
+        -- Providers usually answer errors as JSON with a message;
+        -- prefer it over the raw body.
+        local _, perr = Gemini._parseOpenAI(response_text)
+        if perr and not perr:find("empty response", 1, true)
+            and not perr:find("could not understand", 1, true) then
+            return nil, perr, code
+        end
+        local detail = response_text:sub(1, 300)
+        if detail == "" then detail = "no response body" end
+        return nil, "HTTP " .. tostring(code) .. ": " .. detail, code
+    end
+    local text, err = Gemini._parseOpenAI(response_text)
+    if text then return text end
+    return nil, err, code
+end
+
+-- Full OpenAI-compatible call: one model, transient failures retried
+-- with backoff like the Gemini path.
+function Gemini.generateOpenAI(config, prompt_text, timeout, max_retries)
+    timeout = timeout or 60
+    if max_retries == nil then max_retries = 1 end
+    local last_err
+    for attempt = 0, max_retries do
+        local text, err, code =
+            Gemini._requestOpenAI(config, prompt_text, timeout)
+        if text then return text end
+        last_err = err
+        if not is_transient(code) then
+            return nil, err
+        end
+        if attempt < max_retries then
+            sleep_seconds(4 * (attempt + 1))
+        end
+    end
+    return nil, last_err
+end
+
+-- Single entry point for the plugin: the config's kind picks the wire
+-- format. Dispatch goes through the module table on purpose, so tests
+-- (and future providers) can stub the individual generators.
+function Gemini.generateAny(config, prompt_text, timeout, max_retries)
+    if type(config) == "table" and config.kind == "openai" then
+        return Gemini.generateOpenAI(config, prompt_text, timeout,
+            max_retries)
+    end
+    config = type(config) == "table" and config or {}
+    return Gemini.generate(config.api_key, config.models, prompt_text,
+        timeout, max_retries, Gemini._thinkingBudget(config.reasoning))
 end
 
 return Gemini

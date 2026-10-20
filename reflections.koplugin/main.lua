@@ -21,10 +21,127 @@ local DEFAULT_MODEL = "gemini-3.5-flash-lite"
 local RETIRED_MODELS = {
     ["gemini-2.5-flash"] = true,
 }
+-- Seconds a single generation attempt may run before the provider is
+-- given up on. Heavier reasoning models think for a long while before
+-- answering, so this is generous; the foreground watcher and the
+-- background reaper below are sized to outlast one retry at this cap.
+local REQUEST_TIMEOUT = 300
 local DEFAULT_PROMPT_COUNT = 3
 local DEFAULT_SESSION_PROMPT_COUNT = 6
 local DEFAULT_BOOK_PROMPT_COUNT = 6
 local MAX_PROMPT_COUNT = 20
+
+-- AI providers. Gemini keeps its own wire format; every other
+-- provider speaks the OpenAI chat format and is just a base URL plus
+-- a key and a model. Keys and models are stored per provider, so
+-- switching back and forth loses nothing.
+local AI_PROVIDERS = {
+    { id = "gemini", label = "Gemini" },
+    { id = "openai", label = "OpenAI",
+        base_url = "https://api.openai.com/v1",
+        default_model = "gpt-4o-mini",
+        model_hint = "e.g. gpt-4o-mini" },
+    { id = "anthropic", label = "Anthropic (Claude)",
+        base_url = "https://api.anthropic.com/v1",
+        default_model = "claude-sonnet-4-5",
+        model_hint = "e.g. claude-sonnet-4-5" },
+    { id = "deepseek", label = "DeepSeek",
+        base_url = "https://api.deepseek.com/v1",
+        default_model = "deepseek-chat",
+        model_hint = "e.g. deepseek-chat" },
+    { id = "openrouter", label = "OpenRouter",
+        base_url = "https://openrouter.ai/api/v1",
+        default_model = "meta-llama/llama-3.3-70b-instruct:free",
+        model_hint = "e.g. deepseek/deepseek-chat" },
+    { id = "nvidia", label = "NVIDIA NIM",
+        base_url = "https://integrate.api.nvidia.com/v1",
+        default_model = "z-ai/glm-5.3-flash",
+        model_hint = "e.g. z-ai/glm-5.3-flash" },
+    { id = "xai", label = "xAI (Grok)",
+        base_url = "https://api.x.ai/v1",
+        default_model = "grok-4",
+        model_hint = "e.g. grok-4" },
+    { id = "groq", label = "Groq",
+        base_url = "https://api.groq.com/openai/v1",
+        default_model = "llama-3.3-70b-versatile",
+        model_hint = "e.g. llama-3.3-70b-versatile" },
+    { id = "mistral", label = "Mistral",
+        base_url = "https://api.mistral.ai/v1",
+        default_model = "mistral-small-latest",
+        model_hint = "e.g. mistral-small-latest" },
+    { id = "together", label = "Together",
+        base_url = "https://api.together.xyz/v1",
+        default_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        model_hint = "e.g. meta-llama/Llama-3.3-70B-Instruct-Turbo" },
+    { id = "perplexity", label = "Perplexity",
+        base_url = "https://api.perplexity.ai",
+        default_model = "sonar",
+        model_hint = "e.g. sonar" },
+    { id = "custom", label = "Custom (OpenAI compatible)",
+        default_model = "",
+        model_hint = "Model id for your endpoint" },
+}
+
+local function providerById(id)
+    for _, p in ipairs(AI_PROVIDERS) do
+        if p.id == id then return p end
+    end
+    return AI_PROVIDERS[1]
+end
+
+-- Languages the generated questions can be written in. The label is
+-- what the Settings picker shows; the name is how the prompt refers
+-- to the language, in English so every model reads it the same way.
+local LANGUAGES = {
+    { id = "en", label = "English", name = "English" },
+    { id = "es", label = "Español", name = "Spanish" },
+    { id = "fr", label = "Français", name = "French" },
+    { id = "de", label = "Deutsch", name = "German" },
+    { id = "it", label = "Italiano", name = "Italian" },
+    { id = "pt", label = "Português", name = "Portuguese" },
+    { id = "nl", label = "Nederlands", name = "Dutch" },
+    { id = "pl", label = "Polski", name = "Polish" },
+    { id = "sv", label = "Svenska", name = "Swedish" },
+    { id = "ru", label = "Русский", name = "Russian" },
+    { id = "uk", label = "Українська", name = "Ukrainian" },
+    { id = "tr", label = "Türkçe", name = "Turkish" },
+    { id = "ar", label = "العربية", name = "Arabic" },
+    { id = "hi", label = "हिन्दी", name = "Hindi" },
+    { id = "ja", label = "日本語", name = "Japanese" },
+    { id = "ko", label = "한국어", name = "Korean" },
+    { id = "zh", label = "简体中文", name = "Simplified Chinese" },
+}
+
+local function languageById(id)
+    for _, l in ipairs(LANGUAGES) do
+        if l.id == id then return l end
+    end
+    return LANGUAGES[1]
+end
+
+-- Reasoning levels for the heavier models: how much thinking a model
+-- may do before it answers. Auto sends no control at all, which is
+-- exactly how the plugin behaved before this setting existed.
+local REASONING_LEVELS = {
+    { id = "auto", label = "Auto" },
+    { id = "off", label = "Off" },
+    { id = "low", label = "Low" },
+    { id = "medium", label = "Medium" },
+    { id = "high", label = "High" },
+}
+
+local function reasoningById(id)
+    for _, r in ipairs(REASONING_LEVELS) do
+        if r.id == id then return r end
+    end
+    return REASONING_LEVELS[1]
+end
+
+local function trimValue(v)
+    if type(v) ~= "string" then return "" end
+    return v:gsub("^%s+", ""):gsub("%s+$", "")
+end
+
 
 -- fork()/waitpid() for silent background generation (no UI, ever).
 local ffi_ok, ffi = pcall(require, "ffi")
@@ -88,6 +205,18 @@ end
 function Reflections:migrateFileConfig()
     if not G_reader_settings then return end
     local cfg = self:getFileConfig()
+    -- Background generation used to default on. With paid providers
+    -- supported, it is opt-in now: turn a previously saved "on" off
+    -- exactly once, existing installs included, before any seeding
+    -- below. Installs that never saved a choice fall through to the
+    -- new default in getBackgroundEnabled, and the Settings toggle
+    -- rules for everyone afterwards.
+    if not G_reader_settings:readSetting("reflections_bg_default_reset") then
+        if G_reader_settings:readSetting("reflections_background") == true then
+            G_reader_settings:saveSetting("reflections_background", false)
+        end
+        G_reader_settings:saveSetting("reflections_bg_default_reset", true)
+    end
     local function seed(setting, value)
         if value == nil or value == "" then return end
         local cur = G_reader_settings:readSetting(setting)
@@ -101,6 +230,37 @@ function Reflections:migrateFileConfig()
     seed("reflections_book_prompt_count", tonumber(cfg.book_prompt_count))
     seed("reflections_model", cfg.model)
     seed("reflections_background", cfg.background)
+    -- Provider pre-configuration: the active provider, plus each
+    -- provider's key and model, seed exactly like everything else,
+    -- so any provider can be set up from a computer before install.
+    if type(cfg.provider) == "string" then
+        for _, p in ipairs(AI_PROVIDERS) do
+            if p.id == cfg.provider then
+                seed("reflections_provider", cfg.provider)
+            end
+        end
+    end
+    for _, p in ipairs(AI_PROVIDERS) do
+        if p.id ~= "gemini" then
+            seed("reflections_key_" .. p.id, cfg[p.id .. "_api_key"])
+            seed("reflections_model_" .. p.id, cfg[p.id .. "_model"])
+        end
+    end
+    seed("reflections_custom_base_url", cfg.custom_base_url)
+    if type(cfg.language) == "string" then
+        for _, l in ipairs(LANGUAGES) do
+            if l.id == cfg.language then
+                seed("reflections_language", cfg.language)
+            end
+        end
+    end
+    if type(cfg.reasoning) == "string" then
+        for _, r in ipairs(REASONING_LEVELS) do
+            if r.id == cfg.reasoning then
+                seed("reflections_reasoning", cfg.reasoning)
+            end
+        end
+    end
     -- The API key gets one more rule: if the conf key changed since we last
     -- saw it, the user edited it on their computer and expects it to take
     -- effect, so it overwrites the device key. A blank conf (e.g. right
@@ -140,7 +300,25 @@ function Reflections:getFileConfig()
     return cfg
 end
 
-function Reflections:getApiKey()
+function Reflections:getProviderId()
+    local v
+    if G_reader_settings then
+        v = G_reader_settings:readSetting("reflections_provider")
+    end
+    if type(v) == "string" then
+        for _, p in ipairs(AI_PROVIDERS) do
+            if p.id == v then return v end
+        end
+    end
+    return "gemini"
+end
+
+function Reflections:getProviderLabel()
+    return providerById(self:getProviderId()).label
+end
+
+-- The Gemini key: device setting, then the preconfigured file value.
+function Reflections:getGeminiKey()
     local v
     if G_reader_settings then
         v = G_reader_settings:readSetting("reflections_gemini_key")
@@ -148,9 +326,127 @@ function Reflections:getApiKey()
     if not v or v == "" then
         v = self:getFileConfig().api_key
     end
-    if type(v) ~= "string" then return "" end
-    -- E-ink keyboards love stray spaces: never send them to Google.
-    return v:gsub("^%s+", ""):gsub("%s+$", "")
+    -- E-ink keyboards love stray spaces: never send them to a provider.
+    return trimValue(v)
+end
+
+-- The API key for whichever provider is active.
+function Reflections:getApiKey()
+    local id = self:getProviderId()
+    if id == "gemini" then return self:getGeminiKey() end
+    local v
+    if G_reader_settings then
+        v = G_reader_settings:readSetting("reflections_key_" .. id)
+    end
+    return trimValue(v)
+end
+
+function Reflections:getCustomBaseUrl()
+    local v
+    if G_reader_settings then
+        v = G_reader_settings:readSetting("reflections_custom_base_url")
+    end
+    return (trimValue(v):gsub("/+$", ""))
+end
+
+-- Everything a generation call needs, in the shape the client module
+-- dispatches on: for Gemini the key plus the fallback model chain,
+-- for the OpenAI family the key, one model, and a base URL.
+function Reflections:getAIConfig()
+    local id = self:getProviderId()
+    if id == "gemini" then
+        return { kind = "gemini", label = "Gemini",
+            api_key = self:getGeminiKey(),
+            models = self:getModelChain(),
+            reasoning = self:getReasoningEffort() }
+    end
+    local p = providerById(id)
+    local config = { kind = "openai", label = p.label,
+        provider_id = id,
+        api_key = self:getApiKey(), model = self:getModel(),
+        base_url = p.base_url,
+        reasoning = self:getReasoningEffort() }
+    if id == "custom" then
+        config.base_url = self:getCustomBaseUrl()
+    elseif id == "openrouter" then
+        config.extra_headers = {
+            ["X-Title"] = "Reflections (KOReader)",
+        }
+    end
+    return config
+end
+
+-- Language for the generated questions: device setting, then the
+-- preconfigured file value, then English. Unknown ids fall back to
+-- English rather than producing a broken prompt.
+function Reflections:getQuestionLanguage()
+    local v
+    if G_reader_settings then
+        v = G_reader_settings:readSetting("reflections_language")
+    end
+    if type(v) == "string" then
+        for _, l in ipairs(LANGUAGES) do
+            if l.id == v then return v end
+        end
+    end
+    v = self:getFileConfig().language
+    if type(v) == "string" then
+        for _, l in ipairs(LANGUAGES) do
+            if l.id == v then return v end
+        end
+    end
+    return "en"
+end
+
+function Reflections:getQuestionLanguageLabel()
+    return languageById(self:getQuestionLanguage()).label
+end
+
+function Reflections:getQuestionLanguageName()
+    return languageById(self:getQuestionLanguage()).name
+end
+
+-- Reasoning level for generation calls: device setting, then the
+-- preconfigured file value, then Auto. Unknown values fall back to
+-- Auto rather than sending a control the provider would reject.
+function Reflections:getReasoningEffort()
+    local v
+    if G_reader_settings then
+        v = G_reader_settings:readSetting("reflections_reasoning")
+    end
+    if type(v) == "string" then
+        for _, r in ipairs(REASONING_LEVELS) do
+            if r.id == v then return v end
+        end
+    end
+    v = self:getFileConfig().reasoning
+    if type(v) == "string" then
+        for _, r in ipairs(REASONING_LEVELS) do
+            if r.id == v then return v end
+        end
+    end
+    return "auto"
+end
+
+function Reflections:getReasoningLabel()
+    return reasoningById(self:getReasoningEffort()).label
+end
+
+-- Rule injected into every question prompt. Empty for English, so
+-- English prompts stay exactly as they have always been; cached
+-- questions keep the language they were generated in, new ones use
+-- the current choice.
+function Reflections:getLanguageRule()
+    local id = self:getQuestionLanguage()
+    if id == "en" then return "" end
+    return "- Write every question in " .. languageById(id).name
+        .. ". Use natural, native phrasing, and keep book, chapter, "
+        .. "and character names exactly as they appear in the text\n"
+end
+
+function Reflections:keySetupMessage()
+    return _("Set your ") .. self:getProviderLabel()
+        .. _(" API key first:\nReflections > Settings > API key")
 end
 
 function Reflections:getPromptCount()
@@ -199,6 +495,17 @@ function Reflections:setNonfiction(v)
 end
 
 function Reflections:getModel()
+    local id = self:getProviderId()
+    if id ~= "gemini" then
+        local v
+        if G_reader_settings then
+            v = G_reader_settings:readSetting("reflections_model_" .. id)
+        end
+        if not v or v == "" then
+            v = providerById(id).default_model
+        end
+        return v or ""
+    end
     local v
     if G_reader_settings then
         v = G_reader_settings:readSetting("reflections_model")
@@ -212,19 +519,13 @@ function Reflections:getModel()
     return v
 end
 
--- Models to try in order when generating. The user's chosen model goes
--- first; if Google reports it overloaded (or retired), the next one is
--- tried, since capacity is managed per model.
+-- The model to generate with: exactly the one the user chose. There
+-- is deliberately no fallback chain; if the chosen model is overloaded,
+-- the request is retried and then reported, never silently handed to
+-- a different model. (The name is kept from when this returned a
+-- chain; the client still accepts a list.)
 function Reflections:getModelChain()
-    local primary = self:getModel()
-    local chain, seen = { primary }, { [primary] = true }
-    for _, m in ipairs({ "gemini-3.5-flash", "gemini-3.5-flash-lite" }) do
-        if not seen[m] then
-            chain[#chain + 1] = m
-            seen[m] = true
-        end
-    end
-    return chain
+    return { self:getModel() }
 end
 
 function Reflections:getBackgroundEnabled()
@@ -233,16 +534,20 @@ function Reflections:getBackgroundEnabled()
         v = G_reader_settings:readSetting("reflections_background")
     end
     if v == nil then v = self:getFileConfig().background end
-    if v == nil then return true end
+    -- Off by default: generation spends API quota (and, on paid
+    -- providers, money) silently, so it is opt-in from Settings.
+    if v == nil then return false end
     return v
 end
 
 function Reflections:editApiKey()
+    local provider_id = self:getProviderId()
+    local label = self:getProviderLabel()
     local current = self:getApiKey()
     local dialog
     dialog = InputDialog:new{
-        title = _("Gemini API key"),
-        input_hint = _("Paste your Gemini API key"),
+        title = label .. _(" API key"),
+        input_hint = _("Paste your ") .. label .. _(" API key"),
         input = current,
         buttons = {
             {
@@ -255,7 +560,13 @@ function Reflections:editApiKey()
                     callback = function()
                         local v = dialog:getInputText() or ""
                         v = v:gsub("^%s+", ""):gsub("%s+$", "")
-                        G_reader_settings:saveSetting("reflections_gemini_key", v)
+                        if provider_id == "gemini" then
+                            G_reader_settings:saveSetting(
+                                "reflections_gemini_key", v)
+                        else
+                            G_reader_settings:saveSetting(
+                                "reflections_key_" .. provider_id, v)
+                        end
                         UIManager:close(dialog)
                         UIManager:show(InfoMessage:new{
                             text = _("API key saved."),
@@ -270,11 +581,14 @@ function Reflections:editApiKey()
 end
 
 function Reflections:editModel()
+    local provider_id = self:getProviderId()
+    local label = self:getProviderLabel()
     local current = self:getModel()
     local dialog
     dialog = InputDialog:new{
-        title = _("Gemini model"),
-        input_hint = _("e.g. gemini-3.8-flash"),
+        title = label .. _(" model"),
+        input_hint = providerById(provider_id).model_hint
+            or _("e.g. gemini-3.8-flash"),
         input = current,
         buttons = {
             {
@@ -287,8 +601,45 @@ function Reflections:editModel()
                     callback = function()
                         local v = dialog:getInputText() or ""
                         v = v:gsub("^%s+", ""):gsub("%s+$", "")
-                        if v == "" then v = DEFAULT_MODEL end
-                        G_reader_settings:saveSetting("reflections_model", v)
+                        if provider_id == "gemini" then
+                            if v == "" then v = DEFAULT_MODEL end
+                            G_reader_settings:saveSetting(
+                                "reflections_model", v)
+                        else
+                            G_reader_settings:saveSetting(
+                                "reflections_model_" .. provider_id, v)
+                        end
+                        UIManager:close(dialog)
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function Reflections:editBaseUrl()
+    local current = self:getCustomBaseUrl()
+    local dialog
+    dialog = InputDialog:new{
+        title = _("API base URL"),
+        input_hint = _("e.g. http://192.168.1.10:1234/v1"),
+        input = current,
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = _("Save"),
+                    callback = function()
+                        local v = dialog:getInputText() or ""
+                        v = v:gsub("^%s+", ""):gsub("%s+$", "")
+                            :gsub("/+$", "")
+                        G_reader_settings:saveSetting(
+                            "reflections_custom_base_url", v)
                         UIManager:close(dialog)
                     end,
                 },
@@ -461,17 +812,40 @@ function Reflections:isPartialCache(chapter_title)
     return type(entry) == "table" and entry.partial == true
 end
 
-function Reflections:cachePrompts(chapter_title, prompts, partial)
+function Reflections:cachePrompts(chapter_title, prompts, partial,
+    provider_label)
     local ds = self:getDocStore()
     if not ds then return end
     pcall(function()
         local cache = ds:readSetting("reflections_cache") or {}
+        -- The provider stamp names whoever generated the set. Callers
+        -- that just generated pass it explicitly; callers rewriting a
+        -- set (a one question swap) pass nothing and the original
+        -- stamp survives.
+        local old = cache[chapter_title]
+        local provider = provider_label
+            or (type(old) == "table" and old.provider) or nil
         cache[chapter_title] = { text = prompts, partial = partial and true or false,
-            at = os.time() }
+            at = os.time(), provider = provider }
         ds:saveSetting("reflections_cache", cache)
         ds:saveSetting("reflections_cache_gen", self:getCacheGeneration())
         if ds.flush then ds:flush() end
     end)
+end
+
+-- Which provider generated a set (nil for sets cached before provider
+-- stamps existed, and for sets adopted from orphaned result files,
+-- whose origin is genuinely unknown).
+function Reflections:readCachedProvider(key)
+    if not self:isCacheValid() then return nil end
+    local cache = self:readDocSetting("reflections_cache")
+    if type(cache) ~= "table" then return nil end
+    local entry = cache[key]
+    if type(entry) == "table" and type(entry.provider) == "string"
+        and entry.provider ~= "" then
+        return entry.provider
+    end
+    return nil
 end
 
 -- When a set was generated (nil for sets cached before timestamps existed).
@@ -649,6 +1023,7 @@ function Reflections:buildPrompt(title, author, chapter_title, text, n, old)
             .. "- Do not summarize the chapter\n"
             .. "- Do not reveal or hint at anything not in the text above\n"
             .. CRAFT_RULES
+            .. self:getLanguageRule()
             .. "- Output ONLY the numbered questions, nothing else"
             .. avoidRepeat(old)
     end
@@ -671,6 +1046,7 @@ function Reflections:buildPrompt(title, author, chapter_title, text, n, old)
         .. "- Do not summarize the chapter\n"
         .. "- Do not reveal or hint at anything not in the text above\n"
         .. CRAFT_RULES
+        .. self:getLanguageRule()
         .. "- Output ONLY the numbered questions, nothing else"
         .. avoidRepeat(old)
 end
@@ -913,6 +1289,7 @@ function Reflections:buildSessionPrompt(title, author, from_title, to_title, tex
         .. "- Do not summarize the chapters\n"
         .. "- Do not reveal or hint at anything not in the text above\n"
         .. CRAFT_RULES
+        .. self:getLanguageRule()
         .. "- Output ONLY the numbered questions, nothing else"
         .. avoidRepeat(old)
 end
@@ -989,14 +1366,17 @@ function Reflections:spawnJob(key, prompt_text, opts)
     }
     self._job_errors[key] = nil
 
-    local api_key, models = self:getApiKey(), self:getModelChain()
+    local ai_config = self:getAIConfig()
+    -- Remember which provider is doing the work, so the finished set
+    -- can be stamped with it even if the setting changes meanwhile.
+    self._inflight[key].provider = ai_config.label
     local pid = ffi.C.fork()
     if pid == 0 then
         -- Child: network only. Never touch UI, the document, or plugin state.
-        -- pcall yields generate()'s (text) or (nil, err): keep the error,
+        -- pcall yields generateAny()'s (text) or (nil, err): keep the error,
         -- or every failure surfaces as a bare "nil".
         local okc, result, errmsg =
-            pcall(Gemini.generate, api_key, models, prompt_text, 45, 1)
+            pcall(Gemini.generateAny, ai_config, prompt_text, REQUEST_TIMEOUT, 1)
         local f = io.open(result_path, "w")
         if f then
             if okc and result then
@@ -1056,7 +1436,7 @@ function Reflections:reapBackgroundJobs()
             if done == job.pid or done == -1 then
                 self:collectJobResult(job)
                 self._inflight[title] = nil
-            elseif os.time() - job.started > 300 then
+            elseif os.time() - job.started > 700 then
                 self:stopJob(job)
                 self._inflight[title] = nil
             end
@@ -1075,7 +1455,7 @@ function Reflections:collectJobResult(job)
         content:match("^(%a+)\n([^\n]*)\n([%s%S]*)$")
     if status == "OK" and ctitle and body and body ~= "" then
         if job.overwrite or not self:readCachedPrompts(ctitle) then
-            self:cachePrompts(ctitle, body, job.partial and true or false)
+            self:cachePrompts(ctitle, body, job.partial and true or false, job.provider)
         end
     elseif status == "ERR" and ctitle then
         -- Stashed for the foreground poller; background errors stay silent.
@@ -1117,7 +1497,7 @@ function Reflections:generateForChapter(chapter_title, force, opts)
     opts = opts or {}
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -1190,8 +1570,7 @@ function Reflections:generateForChapterSync(chapter_title, node, next_node, kind
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildPrompt(
         info.title, info.author, chapter_title, text, self:getPromptCount())
-    local result, err = Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    local result, err = Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
     UIManager:close(busy)
 
     if not result then
@@ -1200,7 +1579,7 @@ function Reflections:generateForChapterSync(chapter_title, node, next_node, kind
         })
         return
     end
-    self:cachePrompts(chapter_title, result, partial and true or false)
+    self:cachePrompts(chapter_title, result, partial and true or false, self:getProviderLabel())
     self:showPrompts(chapter_title, result, false)
 end
 
@@ -1326,7 +1705,7 @@ end
 function Reflections:beginReadingSession()
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -1393,7 +1772,7 @@ function Reflections:endReadingSession()
     end
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -1414,11 +1793,10 @@ function Reflections:endReadingSession()
         local busy = InfoMessage:new{ text = _("Generating session prompts...") }
         UIManager:show(busy)
         UIManager:forceRePaint()
-        local result, err = Gemini.generate(self:getApiKey(),
-            self:getModelChain(), prompt_text, 45, 1)
+        local result, err = Gemini.generateAny(self:getAIConfig(), prompt_text, REQUEST_TIMEOUT, 1)
         UIManager:close(busy)
         if result then
-            self:cachePrompts(key, result, false)
+            self:cachePrompts(key, result, false, self:getProviderLabel())
             UIManager:show(InfoMessage:new{
                 text = _("Session prompts have been generated and sent to the Sessions tab."),
             })
@@ -1450,7 +1828,7 @@ end
 function Reflections:showSessionPicker()
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -1608,7 +1986,7 @@ end
 function Reflections:showSessionsScreen()
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -1683,6 +2061,60 @@ function Reflections:showSessionsScreen()
 end
 
 -- Standalone Settings screen, also reachable from Tools > Reflections.
+function Reflections:showProviderPicker()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local items = {}
+    local current = self:getProviderId()
+    for _i, p in ipairs(AI_PROVIDERS) do
+        local entry_id, entry_label = p.id, p.label
+        items[#items + 1] = {
+            text = entry_label
+                .. (entry_id == current and _(" (current)") or ""),
+            callback = function()
+                UIManager:close(menu)
+                G_reader_settings:saveSetting("reflections_provider",
+                    entry_id)
+                self:showAISettingsScreen()
+            end,
+        }
+    end
+    menu = Menu:new{
+        title = _("AI provider"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
+function Reflections:showLanguagePicker()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local items = {}
+    local current = self:getQuestionLanguage()
+    for _i, l in ipairs(LANGUAGES) do
+        local entry_id, entry_label = l.id, l.label
+        items[#items + 1] = {
+            text = entry_label
+                .. (entry_id == current and _(" (current)") or ""),
+            callback = function()
+                UIManager:close(menu)
+                G_reader_settings:saveSetting("reflections_language",
+                    entry_id)
+                self:showSettingsScreen()
+            end,
+        }
+    end
+    menu = Menu:new{
+        title = _("Question language"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
 function Reflections:showSettingsScreen()
     local Menu = require("ui/widget/menu")
     local menu
@@ -1702,16 +2134,22 @@ function Reflections:showSettingsScreen()
     local items = {
         {
             text_func = function()
-                local k = self:getApiKey()
-                if k ~= "" then
-                    -- Fingerprint, not the key: enough to spot a typo.
-                    local fp = k:sub(1, 6) .. "..." .. k:sub(-4)
-                        .. " (" .. #k .. " chars)"
-                    return _("Gemini API key: set [") .. fp .. "]"
-                end
-                return _("Gemini API key: missing")
+                return _("AI: ") .. self:getProviderLabel()
             end,
-            callback = function() self:editApiKey() end,
+            callback = function()
+                UIManager:close(menu)
+                self:showAISettingsScreen()
+            end,
+        },
+        {
+            text_func = function()
+                return _("Question language: ")
+                    .. self:getQuestionLanguageLabel()
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:showLanguagePicker()
+            end,
         },
         countRow(_("Prompts per chapter: "), "chapter",
             Reflections.getPromptCount),
@@ -1719,26 +2157,6 @@ function Reflections:showSettingsScreen()
             Reflections.getSessionPromptCount),
         countRow(_("Prompts per book reflection: "), "book",
             Reflections.getBookPromptCount),
-        {
-            text_func = function()
-                return _("Model: ") .. self:getModel()
-            end,
-            callback = function() self:editModel() end,
-        },
-        {
-            text_func = function()
-                if self:getBackgroundEnabled() then
-                    return _("Generate in background: on")
-                end
-                return _("Generate in background: off")
-            end,
-            callback = function()
-                UIManager:close(menu)
-                G_reader_settings:saveSetting(
-                    "reflections_background", not self:getBackgroundEnabled())
-                self:showSettingsScreen()
-            end,
-        },
         {
             text = _("Clear cached reflections"),
             callback = function()
@@ -1815,13 +2233,125 @@ function Reflections:showSettingsScreen()
     UIManager:show(menu)
 end
 
+function Reflections:showReasoningPicker()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local items = {}
+    local current = self:getReasoningEffort()
+    for _i, r in ipairs(REASONING_LEVELS) do
+        local entry_id, entry_label = r.id, r.label
+        items[#items + 1] = {
+            text = entry_label
+                .. (entry_id == current and _(" (current)") or ""),
+            callback = function()
+                UIManager:close(menu)
+                G_reader_settings:saveSetting("reflections_reasoning",
+                    entry_id)
+                self:showAISettingsScreen()
+            end,
+        }
+    end
+    menu = Menu:new{
+        title = _("Reasoning"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
+-- The AI side of Settings, in its own submenu: provider, key, model,
+-- reasoning, and background generation.
+function Reflections:showAISettingsScreen()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local items = {
+        {
+            text_func = function()
+                return _("AI provider: ") .. self:getProviderLabel()
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:showProviderPicker()
+            end,
+        },
+        {
+            text_func = function()
+                local k = self:getApiKey()
+                if k ~= "" then
+                    -- Fingerprint, not the key: enough to spot a typo.
+                    local fp = k:sub(1, 6) .. "..." .. k:sub(-4)
+                        .. " (" .. #k .. " chars)"
+                    return _("API key (") .. self:getProviderLabel()
+                        .. _("): set [") .. fp .. "]"
+                end
+                return _("API key (") .. self:getProviderLabel()
+                    .. _("): missing")
+            end,
+            callback = function() self:editApiKey() end,
+        },
+        {
+            text_func = function()
+                return _("Model: ") .. self:getModel()
+            end,
+            callback = function() self:editModel() end,
+        },
+        {
+            text_func = function()
+                return _("Reasoning: ") .. self:getReasoningLabel()
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:showReasoningPicker()
+            end,
+        },
+        {
+            text_func = function()
+                if self:getBackgroundEnabled() then
+                    return _("Generate in background: on")
+                end
+                return _("Generate in background: off")
+            end,
+            callback = function()
+                UIManager:close(menu)
+                G_reader_settings:saveSetting(
+                    "reflections_background", not self:getBackgroundEnabled())
+                self:showAISettingsScreen()
+            end,
+        },
+        {
+            text = _("Close"),
+            callback = function() UIManager:close(menu) end,
+        },
+    }
+    if self:getProviderId() == "custom" then
+        -- The model row sits at position 3 (provider, key, model);
+        -- the base URL belongs right under it.
+        table.insert(items, 4, {
+            text_func = function()
+                local u = self:getCustomBaseUrl()
+                if u == "" then u = _("not set") end
+                return _("API base URL: ") .. u
+            end,
+            callback = function() self:editBaseUrl() end,
+        })
+    end
+    menu = Menu:new{
+        title = _("AI"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
 -- Generate (or show cached) questions for a chapter range. Never blocks the
 -- UI: the prompts page opens immediately with a placeholder and fills in
 -- when the forked job's result lands.
 function Reflections:generateForSession(from_title, to_title, force)
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -1900,7 +2430,7 @@ end
 function Reflections:generateForPageSession(from_page, to_page, force)
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -1982,8 +2512,7 @@ function Reflections:generateForPageSessionSync(key, from_label, to_label,
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildSessionPrompt(info.title, info.author,
         from_label, to_label, text, self:getSessionPromptCount())
-    local result, err = Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    local result, err = Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
     UIManager:close(busy)
 
     if not result then
@@ -1992,7 +2521,7 @@ function Reflections:generateForPageSessionSync(key, from_label, to_label,
         })
         return
     end
-    self:cachePrompts(key, result, false)
+    self:cachePrompts(key, result, false, self:getProviderLabel())
     self:recordSession(key, from_page, to_page, "pages")
     self:showSessionPrompts(key, from_label, to_label, result,
         { from_cache = false, regen = regen })
@@ -2015,8 +2544,7 @@ function Reflections:generateForSessionSync(key, from_title, to_title,
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildSessionPrompt(info.title, info.author,
         from_title, to_title, text, self:getSessionPromptCount())
-    local result, err = Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    local result, err = Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
     UIManager:close(busy)
 
     if not result then
@@ -2025,7 +2553,7 @@ function Reflections:generateForSessionSync(key, from_title, to_title,
         })
         return
     end
-    self:cachePrompts(key, result, false)
+    self:cachePrompts(key, result, false, self:getProviderLabel())
     self:recordSession(key, from_title, to_title)
     self:showSessionPrompts(key, from_title, to_title, result,
         { from_cache = false, regen = regen })
@@ -2163,6 +2691,7 @@ function Reflections:buildBookPrompt(title, author, text, n, old)
         .. "- Never ask about the reader's own life, feelings, or experiences\n"
         .. "- Do not summarize the book\n"
         .. CRAFT_RULES
+        .. self:getLanguageRule()
         .. "- Output ONLY the numbered questions, nothing else"
         .. avoidRepeat(old)
 end
@@ -2172,7 +2701,7 @@ end
 function Reflections:showBookPicker()
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -2230,7 +2759,7 @@ end
 function Reflections:generateForBook(force)
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -2310,8 +2839,7 @@ function Reflections:generateForBookSync(key, page_title, regen)
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildBookPrompt(info.title, info.author,
         text, self:getBookPromptCount())
-    local result, err = Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    local result, err = Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
     UIManager:close(busy)
 
     if not result then
@@ -2320,7 +2848,7 @@ function Reflections:generateForBookSync(key, page_title, regen)
         })
         return
     end
-    self:cachePrompts(key, result, false)
+    self:cachePrompts(key, result, false, self:getProviderLabel())
     self:showPrompts(page_title, result, { from_cache = false, regen = regen,
         cache_key = key,
         swap = function(old) return self:fetchOneBookQuestion(old) end })
@@ -2330,9 +2858,114 @@ end
 -- placeholder page for the real prompts (or a readable error) when it
 -- lands. The UI stays responsive the whole time; pressing Back cancels
 -- the watch while the job still caches silently in the background.
+-- Floating notice shown while a foreground generation runs: a small
+-- framed card in the middle of the screen with a Cancel button, so a
+-- long wait on a heavy model is never a trap. It floats over the
+-- prompts page rather than replacing it.
+local InputContainerN = require("ui/widget/container/inputcontainer")
+local GeomN = require("ui/geometry")
+local CenterContainer = require("ui/widget/container/centercontainer")
+local FrameContainerN = require("ui/widget/container/framecontainer")
+local VerticalGroupN = require("ui/widget/verticalgroup")
+local VerticalSpanN = require("ui/widget/verticalspan")
+local TextWidgetN = require("ui/widget/textwidget")
+local ButtonN = require("ui/widget/button")
+local FontN = require("ui/font")
+local BlitbufferN = require("ffi/blitbuffer")
+local GenNotice = InputContainerN:extend{
+    cancel_callback = nil,
+}
+function GenNotice:init()
+    local Screen = require("device").screen
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local pad = Screen:scaleBySize(16)
+    local frame = FrameContainerN:new{
+        background = BlitbufferN.COLOR_WHITE,
+        bordersize = Screen:scaleBySize(2),
+        padding = pad,
+        VerticalGroupN:new{
+            align = "center",
+            TextWidgetN:new{
+                text = _("Generating your prompts…"),
+                face = FontN:getFace("cfont", 22),
+            },
+            VerticalSpanN:new{ width = pad },
+            ButtonN:new{
+                text = _("Cancel"),
+                callback = function()
+                    if self.cancel_callback then
+                        self.cancel_callback()
+                    end
+                end,
+            },
+        },
+    }
+    self[1] = CenterContainer:new{
+        dimen = GeomN:new{ x = 0, y = 0, w = sw, h = sh },
+        frame,
+    }
+    self.dimen = GeomN:new{ x = 0, y = 0, w = sw, h = sh }
+end
+
+function Reflections:showGenNotice()
+    if self._gen_notice then return end
+    local notice = GenNotice:new{
+        cancel_callback = function()
+            -- Deferred, like every other page swap out of a button
+            -- press: restoring the prompts page mid press is what
+            -- wedged the highlights flow in v50 to v54.
+            UIManager:scheduleIn(0, function()
+                self:cancelGeneration()
+            end)
+        end,
+    }
+    self._gen_notice = notice
+    UIManager:show(notice)
+end
+
+function Reflections:closeGenNotice()
+    if self._gen_notice then
+        pcall(UIManager.close, UIManager, self._gen_notice)
+        self._gen_notice = nil
+    end
+end
+
+-- The notice's Cancel button: kill the running job, stop the watcher,
+-- and put the page back the way it was. Previous questions return on
+-- a regen; a first generation simply closes back to the book.
+function Reflections:cancelGeneration()
+    local my = self._pending
+    self:closeGenNotice()
+    if not my then return end
+    self._pending = nil
+    local job = self._inflight[my.title]
+    if job then
+        self:stopJob(job)
+        self._inflight[my.title] = nil
+    end
+    self._job_errors[my.title] = nil
+    if my.old and my.old ~= "" then
+        local opt = { from_cache = true }
+        if my.regen then opt.regen = my.regen end
+        if my.cache_key then opt.cache_key = my.cache_key end
+        if my.swap then opt.swap = my.swap end
+        if my.back_to then opt.back_to = my.back_to end
+        self:showPrompts(my.page_title or my.title, my.old, opt)
+    else
+        self:closePromptsPage()
+    end
+end
+
 function Reflections:pollPendingPrompts()
     local my = self._pending
     if not my then return end
+    -- Page flows get the floating notice with its Cancel button.
+    -- Quiet session ends and Simplify keep their current behavior:
+    -- no card, nothing over the reading screen or the open page.
+    if not my.quiet and not my.simplify and not my._notice then
+        my._notice = true
+        self:showGenNotice()
+    end
     UIManager:scheduleIn(2, function()
         if self._pending ~= my then return end -- superseded or cancelled
         pcall(function() self:reapBackgroundJobs() end)
@@ -2351,6 +2984,7 @@ function Reflections:pollPendingPrompts()
         local job_done = self._inflight[my.title] == nil
         if prompts and (prompts ~= my.old or job_done) then
             self._pending = nil
+            self:closeGenNotice()
             if my.simplify then
                 -- Throwaway reword job: keep it off the prompt cache and
                 -- put the result on the open page, if it still wants it.
@@ -2375,6 +3009,7 @@ function Reflections:pollPendingPrompts()
         local err = self._job_errors[my.title]
         if err then
             self._pending = nil
+            self:closeGenNotice()
             self._job_errors[my.title] = nil
             if my.simplify then
                 local page = self._open_prompts
@@ -2397,8 +3032,9 @@ function Reflections:pollPendingPrompts()
             return
         end
         my.waited = my.waited + 2
-        if my.waited >= 330 then
+        if my.waited >= 660 then
             self._pending = nil
+            self:closeGenNotice()
             if my.simplify then
                 local page = self._open_prompts
                 if page and page.simplify_on then
@@ -2427,6 +3063,10 @@ function Reflections:cancelPending(chapter_title)
     if self._pending and (self._pending.title == chapter_title
         or self._pending.page_title == chapter_title) then
         self._pending = nil
+        -- Leaving the page dismisses the notice too. The job itself
+        -- keeps running and caches silently, as Back has always done;
+        -- killing the job is the notice button's job, not Back's.
+        self:closeGenNotice()
     end
 end
 
@@ -2442,7 +3082,7 @@ end
 function Reflections:reflectCurrent()
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -2623,6 +3263,10 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
     if gen_at then
         header = header .. "\n" .. _("Generated ")
             .. os.date("%b %d, %Y, %I:%M %p", gen_at)
+        local gen_provider = self:readCachedProvider(page.cache_key)
+        if gen_provider then
+            header = header .. " (" .. gen_provider .. ")"
+        end
     end
 
     local dialog
@@ -2861,8 +3505,7 @@ function Reflections:fetchOneChapterQuestion(chapter_title, old)
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildPrompt(info.title, info.author,
         chapter_title, text, 1, old)
-    return Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    return Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
 end
 
 function Reflections:fetchOneSessionQuestion(from_title, to_title, old)
@@ -2882,8 +3525,7 @@ function Reflections:fetchOneSessionQuestion(from_title, to_title, old)
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildSessionPrompt(info.title, info.author,
         from_title, to_title, text, 1, old)
-    return Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    return Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
 end
 
 function Reflections:fetchOnePageSessionQuestion(from_page, to_page, old)
@@ -2894,8 +3536,7 @@ function Reflections:fetchOnePageSessionQuestion(from_page, to_page, old)
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildSessionPrompt(info.title, info.author,
         "page " .. from_page, "page " .. to_page, text, 1, old)
-    return Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    return Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
 end
 
 function Reflections:fetchOneBookQuestion(old)
@@ -2906,8 +3547,7 @@ function Reflections:fetchOneBookQuestion(old)
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildBookPrompt(info.title, info.author,
         text, 1, old)
-    return Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    return Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
 end
 
 -- Tapping a question asks whether to swap it for a new one.
@@ -2936,7 +3576,7 @@ function Reflections:swapQuestion(idx)
     if not page or not page.canonical then return end
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -3248,44 +3888,71 @@ function Reflections:buildHighlightPrompt(title, author, scope_label,
     local passage_text = table.concat(blocks, "\n\n")
     local rules
     if self:isNonfiction() then
-        rules = "Rules:\n"
-            .. "- Anchor every question in one or more passages: the "
-            .. "argument, evidence, concept, or claim in it\n"
-            .. "- Ask what the passage reveals about the author's thinking, "
-            .. "what it connects to, and what to question or challenge in it\n"
-            .. "- Specific to these passages and the book's ideas, never "
-            .. "generic\n"
-            .. "- Open-ended: no yes/no questions, no single correct answer\n"
-            .. "- Never ask about the reader's own life, feelings, or "
-            .. "experiences\n"
+        rules = "A highlight is a vote: the reader marked each of these "
+            .. "passages for a reason of their own, and each question "
+            .. "helps them discover that reason and put it into words. "
+            .. "Reasons a passage earns a mark in nonfiction:\n"
+            .. "- a claim the reader wants to challenge or test\n"
+            .. "- evidence or reasoning that genuinely persuaded them\n"
+            .. "- an idea they want to keep, use, or act on\n"
+            .. "- a concept that finally clicked into place\n"
+            .. "- a passage that clashes with what they believed before\n"
+            .. "- a step in the argument they do not yet follow\n"
+            .. "Rules:\n"
+            .. "- Ask about one passage per question; when there are more "
+            .. "passages than questions, choose the ones with the most "
+            .. "to ask about\n"
+            .. "- Pick the most plausible reason for each passage, and "
+            .. "vary the reasons across the set when the passages allow\n"
+            .. "- Phrase each question as an invitation, not an "
+            .. "assumption: name the likely pull and leave room for the "
+            .. "reader's real reason to be a different one\n"
+            .. "- Keep questions on the passage and the reader's thinking "
+            .. "about it, never diary prompts detached from the text\n"
             .. "- Do not summarize the passages\n"
             .. "- Do not reveal or hint at anything not in the passages above\n"
     else
-        rules = "Rules:\n"
-            .. "- Anchor every question in one or more passages: the moment, "
-            .. "choice, image, or line in it\n"
-            .. "- Ask what the passage sets up, echoes, or complicates within "
-            .. "the story so far; what question the passage itself raises\n"
-            .. "- Specific to these passages, never generic\n"
-            .. "- Open-ended: no yes/no questions, no single correct answer\n"
-            .. "- Never ask about the reader's own life, feelings, or "
-            .. "experiences\n"
+        rules = "A highlight is a vote: the reader marked each of these "
+            .. "passages for a reason of their own, and each question "
+            .. "helps them discover that reason and put it into words. "
+            .. "Reasons a passage earns a mark in fiction:\n"
+            .. "- the beauty of the wording itself\n"
+            .. "- recognition: it said something the reader already felt "
+            .. "or believed, in words they did not have\n"
+            .. "- friction: they agree strongly, or want to push back\n"
+            .. "- a detail that feels loaded, as if it will matter later\n"
+            .. "- genuine confusion about what is happening, or why\n"
+            .. "- a feeling the passage stirred in them\n"
+            .. "- a moment simply worth keeping and returning to\n"
+            .. "Rules:\n"
+            .. "- Ask about one passage per question; when there are more "
+            .. "passages than questions, choose the ones with the most "
+            .. "to ask about\n"
+            .. "- Pick the most plausible reason for each passage, and "
+            .. "vary the reasons across the set when the passages allow\n"
+            .. "- Phrase each question as an invitation, not an "
+            .. "assumption: name the likely pull and leave room for the "
+            .. "reader's real reason to be a different one\n"
+            .. "- Keep questions on the passage and the reader's response "
+            .. "to it, never diary prompts detached from the text\n"
             .. "- Do not summarize the passages\n"
             .. "- Do not reveal or hint at anything not in the passages above\n"
     end
     local intro
     if self:isNonfiction() then
-        intro = "You are a reading companion helping someone think deeply "
-            .. "about the nonfiction book they just read. These are passages "
-            .. "they chose to highlight while reading; they will answer with "
-            .. "pen and paper in a physical journal, so make each question "
-            .. "open-ended and worth writing about.\n\n"
+        intro = "You are a reading companion helping someone think about "
+            .. "the nonfiction book they just read. These are passages "
+            .. "they chose to highlight while reading, the moments their "
+            .. "own hand picked out of the whole book; they will answer "
+            .. "with pen and paper in a physical journal, so make each "
+            .. "question worth writing about.\n\n"
     else
-        intro = "You are a reading companion helping someone think deeply "
-            .. "about the story they just read. These are passages they chose "
-            .. "to highlight while reading; they will answer with pen and "
-            .. "paper in a physical journal, so make each question "
-            .. "open-ended and worth writing about.\n\n"
+        intro = "You are a reading companion helping someone think about "
+            .. "the story they just read. These are passages they chose "
+            .. "to highlight while reading, the moments their own hand "
+            .. "picked out of the whole book; they will answer with pen "
+            .. "and paper in a physical journal, so make each question "
+            .. "worth writing about.\n\n"
     end
     return intro
         .. "Book: \"" .. title .. "\" by " .. author .. "\n\n"
@@ -3294,6 +3961,7 @@ function Reflections:buildHighlightPrompt(title, author, scope_label,
         .. "Write exactly " .. tostring(n) .. " numbered discussion "
         .. "questions grounded in these passages. " .. rules
         .. CRAFT_RULES
+        .. self:getLanguageRule()
         .. "- Output ONLY the numbered questions, nothing else"
         .. avoidRepeat(old)
 end
@@ -3306,8 +3974,7 @@ function Reflections:fetchOneHighlightQuestion(scope, old)
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildHighlightPrompt(info.title, info.author,
         self:highlightScopeLabel(scope), passages, 1, old)
-    return Gemini.generate(self:getApiKey(), self:getModelChain(),
-        prompt, 45, 1)
+    return Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
 end
 
 function Reflections:generateForHighlightsSync(scope, hl_key, hl_title,
@@ -3317,8 +3984,7 @@ function Reflections:generateForHighlightsSync(scope, hl_key, hl_title,
     UIManager:show(busy)
     UIManager:forceRePaint()
 
-    local result, err = Gemini.generate(self:getApiKey(),
-        self:getModelChain(), prompt, 45, 1)
+    local result, err = Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
     UIManager:close(busy)
 
     if not result then
@@ -3327,7 +3993,7 @@ function Reflections:generateForHighlightsSync(scope, hl_key, hl_title,
         })
         return
     end
-    self:cachePrompts(hl_key, result, false)
+    self:cachePrompts(hl_key, result, false, self:getProviderLabel())
     self:showPrompts(hl_title, result, { from_cache = false,
         cache_key = hl_key, regen = regen, swap = swap,
         back_to = back_to })
@@ -3336,7 +4002,7 @@ end
 function Reflections:generateForHighlights(scope, force)
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         return
     end
@@ -3459,10 +4125,16 @@ end
 -- Build the reword prompt: the same questions, lighter and more relaxed.
 -- Never dumbs them down, just easier to sit with.
 function Reflections:buildSimplifyPrompt(questions)
+    local lang = ""
+    if self:getQuestionLanguage() ~= "en" then
+        lang = " Write the reworded questions in "
+            .. self:getQuestionLanguageName() .. "."
+    end
     return "Reword these discussion questions to be simpler, lighter, and "
         .. "more relaxed. Keep the same substance, specificity, and details "
         .. "-- don't dumb them down, just make them easier to sit with on a "
-        .. "quiet day. Output ONLY the numbered questions, nothing else.\n\n"
+        .. "quiet day. Output ONLY the numbered questions, nothing else."
+        .. lang .. "\n\n"
         .. "Questions:\n---\n" .. questions .. "\n---"
 end
 
@@ -3500,7 +4172,7 @@ function Reflections:requestSimplify()
     if self:getApiKey() == "" then
         page.simplify_on = false
         UIManager:show(InfoMessage:new{
-            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+            text = self:keySetupMessage(),
         })
         self:showPrompts(page.title, page.canonical,
             { display_only = true, from_cache = page.from_cache })
@@ -3510,8 +4182,7 @@ function Reflections:requestSimplify()
     if not self:shouldFork() then
         -- Synchronous fallback (Android never forks: unreliable there).
         local okc, result =
-            pcall(Gemini.generate, self:getApiKey(), self:getModelChain(),
-                prompt, 45, 1)
+            pcall(Gemini.generateAny, self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
         if okc and result then
             page.simplified = result
             self:showPrompts(page.title, result,
