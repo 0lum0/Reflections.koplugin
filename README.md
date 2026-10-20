@@ -30,7 +30,8 @@ one.
 - **Reading sessions**: begin a session when you start reading and end it
   when you stop. Questions generate quietly for exactly what you covered,
   and a small notification tells you when they're waiting in the Sessions
-  tab. Prefer to pick manually? Choose the first and last chapter yourself.
+  tab. Prefer to pick manually? Choose the first and last chapter yourself,
+  or flip the picker to Pages and choose a page range instead.
   Past sessions are listed newest first with date and time, and kept for
   re-reading. End a session on the very first page of a chapter and that
   chapter is left out, so questions never touch what you haven't read.
@@ -109,7 +110,8 @@ It's fast, cheap, and more than capable of writing good discussion questions.
 entry (with a confirmation step) that wipes every saved question for the
 current book, including your previous sessions list. A checkbox lets you keep
 the sessions if you'd rather. Holding a single chapter regenerates just that
-chapter.
+chapter. *Clear cached reflections (all books)* does the same wipe for
+every book at once, in one tap.
 
 **How session questions are built**: the first 3 are always open-ended
 cross-chapter questions. Past 3, each question takes one random lens from ten
