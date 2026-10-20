@@ -466,11 +466,24 @@ function Reflections:cachePrompts(chapter_title, prompts, partial)
     if not ds then return end
     pcall(function()
         local cache = ds:readSetting("reflections_cache") or {}
-        cache[chapter_title] = { text = prompts, partial = partial and true or false }
+        cache[chapter_title] = { text = prompts, partial = partial and true or false,
+            at = os.time() }
         ds:saveSetting("reflections_cache", cache)
         ds:saveSetting("reflections_cache_gen", self:getCacheGeneration())
         if ds.flush then ds:flush() end
     end)
+end
+
+-- When a set was generated (nil for sets cached before timestamps existed).
+function Reflections:readCachedAt(key)
+    if not self:isCacheValid() then return nil end
+    local cache = self:readDocSetting("reflections_cache")
+    if type(cache) ~= "table" then return nil end
+    local entry = cache[key]
+    if type(entry) == "table" and type(entry.at) == "number" then
+        return entry.at
+    end
+    return nil
 end
 
 -- Forget every cached prompt for the current book.
@@ -586,6 +599,20 @@ local CRAFT_RULES =
     .. "Two-part shape: 'When [specific thing happens]. [Question it "
     .. "raises]?' Direct shape: 'Was [character] right to [choice]?' or "
     .. "'Why did [character] [action]?'\n"
+    .. "- A two-part question must CLOSE with a direct question: a why "
+    .. "('why did [character] [action]?'), a judgment ('was [character] "
+    .. "right to [choice]?'), or a what-would-you-do. Never close a "
+    .. "two-part question by observing what a moment reveals, suggests, "
+    .. "or shows about something\n"
+    .. "- Spread the set across the chapter: no two questions about the "
+    .. "same scene, choice, line, or image. Dig past the chapter's most "
+    .. "obvious dramatic beats; quieter moments often make the best "
+    .. "questions\n"
+    .. "- Questions do not have to be deep or philosophical, but each one "
+    .. "has to open something: if a question's honest answer is obvious "
+    .. "and fits in a few words, skip it, whatever the size of the moment. "
+    .. "Light questions about small moments are welcome when they invite "
+    .. "noticing, wondering, or comparing\n"
     .. "- At least one question should zoom in on a single moment, choice, "
     .. "or line rather than a broad theme\n"
     .. "- Don't embed the answer in the question; leave the conclusion "
@@ -596,8 +623,9 @@ local CRAFT_RULES =
 local function avoidRepeat(old)
     if not old or old == "" then return "" end
     return "\nThe reader already saw these questions:\n---\n" .. old
-        .. "\n---\nAsk DIFFERENT questions: different moments, different "
-        .. "angles, no repeats."
+        .. "\n---\nAsk DIFFERENT questions. Do not reuse any scene, "
+        .. "choice, line, or image the questions above touched; pick "
+        .. "different moments entirely, from different angles."
 end
 
 function Reflections:buildPrompt(title, author, chapter_title, text, n, old)
@@ -745,6 +773,53 @@ end
 -- Returns organic_n, {lens, ...}, playful.
 local PLAYFUL_CHANCE = 0.35
 
+-- The playful question rotates through archetypes, one picked per
+-- generation. Listing several examples in the prompt made the model grab
+-- the same one every time (casting choices), so the prompt only ever
+-- names the one archetype picked here.
+local PLAYFUL_SESSION = {
+    "asking for a better title for one of the chapters",
+    "casting choices for a movie version of a scene",
+    "a one-sentence dramatic summary of the session",
+    "asking which character from these chapters the reader would want "
+        .. "to have dinner with, and what they would ask them",
+    "asking what song should play over the end of the last chapter, "
+        .. "and why",
+    "a one-sentence pitch that would make a friend pick up this book",
+}
+local PLAYFUL_SESSION_NF = {
+    "asking for a better title for one of the chapters",
+    "asking which idea deserves its own TED talk",
+    "a one-sentence dramatic summary of the session",
+    "asking the reader to explain one idea from these chapters to a "
+        .. "smart ten-year-old",
+    "asking which claim from these chapters would make the best "
+        .. "debate motion",
+    "a bumper-sticker version of one idea from these chapters",
+}
+local PLAYFUL_BOOK = {
+    "asking for a better title for the book",
+    "casting choices for a movie version",
+    "a one-sentence dramatic summary of the whole story",
+    "asking which character the reader would want to have dinner with, "
+        .. "and what they would ask them",
+    "asking what song should play over the final scene, and why",
+    "a one-sentence pitch that would make a friend pick up this book",
+}
+local PLAYFUL_BOOK_NF = {
+    "asking for a better title for the book",
+    "asking which idea deserves its own TED talk",
+    "a one-sentence dramatic summary of the whole book",
+    "asking the reader to explain the book's biggest idea to a smart "
+        .. "ten-year-old",
+    "asking which claim from the book would make the best debate motion",
+    "a bumper-sticker version of the book's core idea",
+}
+
+local function pickPlayful(pool)
+    return pool[math.random(#pool)]
+end
+
 local function planQuestions(n, lenses)
     if n <= 3 then return n, {}, false end
     local picked = pickLenses(n - 3, lenses)
@@ -796,17 +871,8 @@ function Reflections:buildSessionPrompt(title, author, from_title, to_title, tex
     end
 
     if playful then
-        if nf then
-            table.insert(steps, "finally write 1 playful, creative question: "
-                .. "for example, asking for a better title for one of the "
-                .. "chapters, which idea deserves its own TED talk, or "
-                .. "a one-sentence dramatic summary of the session")
-        else
-            table.insert(steps, "finally write 1 playful, creative question: "
-                .. "for example, asking for a better title for one of the "
-                .. "chapters, casting choices for a movie version of a scene, or "
-                .. "a one-sentence dramatic summary of the session")
-        end
+        table.insert(steps, "finally write 1 playful, creative question: "
+            .. pickPlayful(nf and PLAYFUL_SESSION_NF or PLAYFUL_SESSION))
     end
 
     local intro
@@ -1974,6 +2040,37 @@ function Reflections:showSessionPrompts(key, from_title, to_title, prompts, opt)
             self:generateForSession(from_title, to_title, true)
         end
     end
+    -- Page sessions arrive as "page N" labels from the live flow and
+    -- as raw numbers from the saved sessions list.
+    local f = tonumber(from_title)
+        or tonumber((tostring(from_title):match("^page (%d+)$")))
+    local t = tonumber(to_title)
+        or tonumber((tostring(to_title):match("^page (%d+)$")))
+    if not opt.swap then
+        if f and t then
+            opt.swap = function(old)
+                return self:fetchOnePageSessionQuestion(f, t, old)
+            end
+        else
+            opt.swap = function(old)
+                return self:fetchOneSessionQuestion(from_title, to_title, old)
+            end
+        end
+    end
+    if not opt.hl_scope then
+        if f and t then
+            opt.hl_scope = { kind = "pages", from = f, to = t }
+        else
+            opt.hl_scope = { kind = "session", from = from_title, to = to_title }
+        end
+    end
+    if not opt.back_to then
+        -- Session pages are reached from the Sessions screen, so Back
+        -- belongs there, not at the chapter browser.
+        opt.back_to = function()
+            self:showSessionsScreen()
+        end
+    end
     self:showPrompts(key, prompts, opt)
 end
 
@@ -2027,17 +2124,8 @@ function Reflections:buildBookPrompt(title, author, text, n, old)
     end
 
     if playful then
-        if nf then
-            table.insert(steps, "finally write 1 playful, creative question: "
-                .. "for example, asking for a better title for the book, which "
-                .. "idea deserves its own TED talk, or a one-sentence dramatic "
-                .. "summary of the whole book")
-        else
-            table.insert(steps, "finally write 1 playful, creative question: "
-                .. "for example, asking for a better title for the book, casting "
-                .. "choices for a movie version, or a one-sentence dramatic "
-                .. "summary of the whole story")
-        end
+        table.insert(steps, "finally write 1 playful, creative question: "
+            .. pickPlayful(nf and PLAYFUL_BOOK_NF or PLAYFUL_BOOK))
     end
 
     local intro
@@ -2099,7 +2187,8 @@ function Reflections:showBookPicker()
             callback = function()
                 UIManager:close(menu)
                 self:showPrompts(self:getBookReflectionTitle(), cached,
-                    { from_cache = true,
+                    { from_cache = true, cache_key = key,
+                      swap = function(old) return self:fetchOneBookQuestion(old) end,
                       regen = function() self:generateForBook(true) end })
             end,
         })
@@ -2150,11 +2239,17 @@ function Reflections:generateForBook(force)
     local regen = function()
         self:generateForBook(true)
     end
+    local function bookOpt(extra)
+        local o = { cache_key = key,
+            swap = function(old) return self:fetchOneBookQuestion(old) end,
+            regen = regen }
+        for k, v in pairs(extra or {}) do o[k] = v end
+        return o
+    end
     if not force then
         local cached = self:readCachedPrompts(key)
         if cached then
-            self:showPrompts(page_title, cached,
-                { from_cache = true, regen = regen })
+            self:showPrompts(page_title, cached, bookOpt{ from_cache = true })
             return
         end
     end
@@ -2175,7 +2270,7 @@ function Reflections:generateForBook(force)
     end
 
     self:showPrompts(page_title, _("Generating your prompts…"),
-        { placeholder = true, regen = regen })
+        bookOpt{ placeholder = true })
     self._pending = {
         title = key,
         page_title = page_title,
@@ -2187,7 +2282,7 @@ function Reflections:generateForBook(force)
     if not ok or not text or #text < 50 then
         self._pending = nil
         self:showPrompts(page_title,
-            _("Could not extract enough text from this book."), { regen = regen })
+            _("Could not extract enough text from this book."), bookOpt{})
         return
     end
     local info = Chapters.getBookInfo(self.ui)
@@ -2226,8 +2321,9 @@ function Reflections:generateForBookSync(key, page_title, regen)
         return
     end
     self:cachePrompts(key, result, false)
-    self:showPrompts(page_title, result,
-        { from_cache = false, regen = regen })
+    self:showPrompts(page_title, result, { from_cache = false, regen = regen,
+        cache_key = key,
+        swap = function(old) return self:fetchOneBookQuestion(old) end })
 end
 
 -- Watches the forked job started by generateForChapter and swaps the
@@ -2246,6 +2342,9 @@ function Reflections:pollPendingPrompts()
         local function showIt(prompts, opt)
             opt = opt or {}
             if my.regen then opt.regen = my.regen end
+            if my.cache_key then opt.cache_key = my.cache_key end
+            if my.swap then opt.swap = my.swap end
+            if my.back_to then opt.back_to = my.back_to end
             self:showPrompts(my.page_title or my.title, prompts, opt)
         end
         local prompts = self:readCachedPrompts(my.title)
@@ -2362,6 +2461,63 @@ end
 -- Full-screen prompts page: the chapter's questions, with New prompts
 -- and Back buttons. A dedicated screen, not an overlay dialog.
 -- opt may be a boolean (from_cache) or a table { from_cache, placeholder }.
+-- ------------------------------------------------------------- prompts page
+
+-- Standbys for anything the generated questions did not prompt,
+-- behind the "Journaling Extras" row at the bottom of the page.
+function Reflections:showJournalingExtras()
+    local InfoMessage = require("ui/widget/infomessage")
+    UIManager:show(InfoMessage:new{
+        text = _("Journaling Extras\n\n"
+            .. "A few standbys for anything the questions missed:\n\n"
+            .. "Predict what happens next, and put odds on it.\n\n"
+            .. "Who changed the most this time, even a little?\n\n"
+            .. "Confused? Write it down. The book may answer it later.\n\n"
+            .. "What stuck? A line, a scene, anything that stayed "
+            .. "with you.\n\n"
+            .. "One small detail that felt deliberate. Note it, no "
+            .. "theory needed.\n\n"
+            .. "Dear future you: one sentence on where things stand, "
+            .. "for when you pick the book back up."),
+    })
+end
+
+-- One tappable question on the prompts page, following KOReader's own
+-- MenuItem pattern: a TextBoxWidget in an InputContainer whose tap range
+-- is its own size. Taps land here; pans and swipes scroll the container
+-- around it.
+local InputContainer = require("ui/widget/container/inputcontainer")
+local GestureRange = require("ui/gesturerange")
+local GeomQ = require("ui/geometry")
+local TextBoxWidgetQ = require("ui/widget/textboxwidget")
+local QuestionBlock = InputContainer:extend{
+    text = nil,
+    face = nil,
+    width = nil,
+    idx = nil,
+    callback = nil,
+}
+function QuestionBlock:init()
+    local tb = TextBoxWidgetQ:new{
+        text = self.text,
+        face = self.face,
+        width = self.width,
+    }
+    self[1] = tb
+    local size = tb:getSize()
+    self.dimen = GeomQ:new{ x = 0, y = 0, w = size.w, h = size.h }
+    self.ges_events = {
+        TapQuestion = {
+            GestureRange:new{ ges = "tap", range = self.dimen },
+        },
+    }
+end
+function QuestionBlock:onTapQuestion(arg, ges)
+    if not self.dimen then return end
+    if self.callback then self.callback(self.idx) end
+    return true
+end
+
 function Reflections:showPrompts(chapter_title, prompts, opt)
     local from_cache, placeholder, display_only, is_error
     if type(opt) == "table" then
@@ -2412,7 +2568,24 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
         -- New prompts keeps working after toggle rebuilds (sessions, book).
         regen = (type(opt) == "table" and opt.regen)
             or (same_page and prev.regen) or nil,
+        -- Cache key for this page; differs from the title only for the
+        -- book reflection. Swap fetches one fresh question for this page.
+        cache_key = (type(opt) == "table" and opt.cache_key)
+            or (same_page and prev.cache_key) or chapter_title,
+        swap = (type(opt) == "table" and opt.swap)
+            or (same_page and prev.swap) or nil,
+        -- Highlight questions: sessions carry their scope; chapter pages
+        -- resolve it from the title.
+        hl_scope = (type(opt) == "table" and opt.hl_scope)
+            or (same_page and prev.hl_scope) or nil,
+        -- Where Back goes when it isn't the chapter browser (the
+        -- highlights page returns to the page it was opened from).
+        back_to = (type(opt) == "table" and opt.back_to)
+            or (same_page and prev.back_to) or nil,
     }
+    if not page.hl_scope and not page.regen then
+        page.hl_scope = { kind = "chapter", title = chapter_title }
+    end
     if same_page then
         page.simplify_on = prev.simplify_on
         page.canonical = prev.canonical
@@ -2442,33 +2615,162 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
     -- is harmless.
     local toggle_w = Screen:scaleBySize(200)
 
-    local body
-    if placeholder or auto_simplify then
-        -- auto_simplify shows its own status line while the reword runs
-        body = auto_simplify and _("Simplifying…") or prompts
-    else
-        local header = _("Grab your journal and a pen.")
-        if from_cache then
-            header = header .. " " .. _("(saved from earlier)")
-        end
-        body = header .. "\n\n" .. prompts
+    local header = _("Grab your journal and a pen.")
+    if from_cache then
+        header = header .. " " .. _("(saved from earlier)")
+    end
+    local gen_at = not is_error and self:readCachedAt(page.cache_key)
+    if gen_at then
+        header = header .. "\n" .. _("Generated ")
+            .. os.date("%b %d, %Y, %I:%M %p", gen_at)
     end
 
     local dialog
-    local function goBack()
+    local function doGoBack()
         self:cancelPending(chapter_title)
+        local back_to = page.back_to
         self:closePromptsPage()
-        self:showMainScreen()
+        if back_to then
+            back_to()
+        else
+            self:showMainScreen()
+        end
+    end
+    local function goBack()
+        -- Highlights pages: leaving swaps one prompts page for
+        -- another in the middle of the Back press, which can wedge
+        -- the device (field reports v50 to v53: Back froze on this
+        -- page only, fresh or cached). Let the press finish first;
+        -- the same steps then run from the scheduler.
+        if page.cache_key:sub(-12) == "::highlights" then
+            UIManager:scheduleIn(0, doGoBack)
+        else
+            doGoBack()
+        end
     end
 
-    -- Built separately so we can hand it the dialog reference
-    -- ScrollTextWidget needs for its scrollbar refreshes.
-    local scroll_widget = ScrollTextWidget:new{
-        text = body,
-        face = Font:getFace("cfont", 22),
-        width = sw - pad * 2,
-        height = text_h,
-    }
+    -- The questions body. A clean question set renders as one tappable
+    -- block per question (a tap asks to swap that question) inside a
+    -- scrollable container; the header rides along as a plain block.
+    -- Placeholder, status, and error pages keep the plain scrolling text.
+    local TextBoxWidget = require("ui/widget/textboxwidget")
+    local ScrollableContainer = require("ui/widget/container/scrollablecontainer")
+    local Geom = require("ui/geometry")
+    local scroll_widget
+    local use_blocks = false
+    local display_qs
+    if not placeholder and not auto_simplify and not is_error
+        and page.canonical then
+        display_qs = self:splitQuestions(prompts)
+        if #display_qs > 0
+            and #display_qs == #self:splitQuestions(page.canonical) then
+            use_blocks = true
+        end
+    end
+    if use_blocks then
+        -- The container reserves 3 scrollbar widths on the right when
+        -- the content scrolls vertically; blocks must fit inside that
+        -- crop or the text gets clipped and a sideways scrollbar shows.
+        local inner_w = sw - pad * 2 - 3 * Screen:scaleBySize(6)
+        local content = { align = "left" }
+        table.insert(content, TextBoxWidget:new{
+            text = header,
+            face = Font:getFace("cfont", 22),
+            width = inner_w,
+        })
+        for i, q in ipairs(display_qs) do
+            local idx = i
+            table.insert(content, VerticalSpan:new{
+                width = Screen:scaleBySize(26) })
+            -- init() is not automatic: KOReader calls it explicitly
+            -- (as Menu does for its items) because layout needs the
+            -- TextBoxWidget measured first.
+            local block = QuestionBlock:new{
+                text = idx .. ". " .. q,
+                face = Font:getFace("cfont", 22),
+                width = inner_w,
+                idx = idx,
+                callback = function() self:askSwapQuestion(idx) end,
+            }
+            block:init()
+            table.insert(content, block)
+        end
+        -- A quiet extra under the last question: standbys for anything
+        -- the generated questions did not prompt.
+        table.insert(content, VerticalSpan:new{
+            width = Screen:scaleBySize(26) })
+        local tips = QuestionBlock:new{
+            text = _("Journaling Extras ›"),
+            face = Font:getFace("cfont", 22),
+            width = inner_w,
+            idx = 0,
+            callback = function() self:showJournalingExtras() end,
+        }
+        tips:init()
+        table.insert(content, tips)
+        scroll_widget = ScrollableContainer:new{
+            dimen = Geom:new{ x = 0, y = 0, w = sw - pad * 2, h = text_h },
+            VerticalGroup:new(content),
+        }
+    else
+        local body
+        if placeholder or auto_simplify then
+            -- auto_simplify shows its own status line while the reword runs
+            body = auto_simplify and _("Simplifying…") or prompts
+        else
+            body = header .. "\n\n" .. prompts
+        end
+        -- Built separately so we can hand it the dialog reference
+        -- ScrollTextWidget needs for its scrollbar refreshes.
+        scroll_widget = ScrollTextWidget:new{
+            text = body,
+            face = Font:getFace("cfont", 22),
+            width = sw - pad * 2,
+            height = text_h,
+        }
+    end
+
+    -- The button row: "Highlights" replaces the old "Swap one" button
+    -- (tapping a question now handles swapping). Both appear only once
+    -- there are questions on the page.
+    local row_items = { align = "center" }
+    table.insert(row_items, Button:new{
+        text = _("New prompts"),
+        callback = function()
+            if page.regen then
+                page.regen()
+            else
+                self:generateForChapter(chapter_title, true)
+            end
+        end,
+    })
+    -- Highlights button: always present on scoped question pages (a tap
+    -- with no highlights shows a friendly note); tap-a-question now
+    -- handles swapping, so the old "Swap one" button is gone.
+    if page.canonical and page.hl_scope then
+        table.insert(row_items, HorizontalSpan:new{ width = pad })
+        table.insert(row_items, Button:new{
+            text = _("Highlights"),
+            callback = function()
+                self:generateForHighlights(page.hl_scope, false)
+            end,
+        })
+    end
+    table.insert(row_items, HorizontalSpan:new{ width = pad })
+    table.insert(row_items, CheckButton:new{
+        text = _("Simplify"),
+        checked = page.simplify_on,
+        -- Explicit width: CheckButton has no parent at
+        -- construction time to measure against, so without
+        -- this it crashes (checkbutton.lua).
+        width = toggle_w,
+        callback = function() self:toggleSimplify() end,
+    })
+    table.insert(row_items, HorizontalSpan:new{ width = pad })
+    table.insert(row_items, Button:new{
+        text = _("Back"),
+        callback = goBack,
+    })
 
     dialog = FrameContainer:new{
         width = sw,
@@ -2486,44 +2788,660 @@ function Reflections:showPrompts(chapter_title, prompts, opt)
             VerticalSpan:new{ width = pad },
             scroll_widget,
             VerticalSpan:new{ width = pad },
-            HorizontalGroup:new{
-                align = "center",
-                Button:new{
-                    text = _("New prompts"),
-                    callback = function()
-                        if page.regen then
-                            page.regen()
-                        else
-                            self:generateForChapter(chapter_title, true)
-                        end
-                    end,
-                },
-                HorizontalSpan:new{ width = pad },
-                CheckButton:new{
-                    text = _("Simplify"),
-                    checked = page.simplify_on,
-                    -- Explicit width: CheckButton has no parent at
-                    -- construction time to measure against, so without
-                    -- this it crashes (checkbutton.lua).
-                    width = toggle_w,
-                    callback = function() self:toggleSimplify() end,
-                },
-                HorizontalSpan:new{ width = pad },
-                Button:new{
-                    text = _("Back"),
-                    callback = goBack,
-                },
-            },
+            HorizontalGroup:new(row_items),
         },
     }
-    scroll_widget.dialog = dialog
+    if use_blocks then
+        -- Lets UIManager crop inner repaints to the scroll area, and
+        -- points the container's scroll repaints at this dialog:
+        -- without show_parent, scrolling moved the content internally
+        -- but the screen never repainted (field report, v47).
+        dialog.cropping_widget = scroll_widget
+        scroll_widget.show_parent = dialog
+    else
+        scroll_widget.dialog = dialog
+    end
     page.dialog = dialog
     self._open_prompts = page
+    -- One prompts page at a time. Prompts pages used to stack: nothing
+    -- closed the previous page, so prompts to prompts navigation (the
+    -- highlights flow) piled fullscreen dialogs, each holding a full
+    -- screen compose buffer, and Back only ever closed the top one.
+    if prev and prev.dialog and prev.dialog ~= dialog then
+        UIManager:close(prev.dialog)
+    end
     UIManager:show(dialog)
 
     if auto_simplify then
         self:requestSimplify()
     end
+end
+
+-- -------------------------------------------------------------- swap one
+
+-- Split a generated set ("1. ...\n\n2. ...") into bare question texts.
+function Reflections:splitQuestions(text)
+    local out, cur = {}, nil
+    if type(text) ~= "string" then return out end
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        local rest = line:match("^%s*%d+[%.%)]%s+(.*)$")
+        if rest then
+            if cur then table.insert(out, cur) end
+            cur = rest
+        elseif cur and line:match("%S") then
+            cur = cur .. " " .. line:gsub("^%s+", "")
+        end
+    end
+    if cur then table.insert(out, cur) end
+    return out
+end
+
+function Reflections:joinQuestions(questions)
+    local parts = {}
+    for i, q in ipairs(questions) do
+        parts[i] = i .. ". " .. q
+    end
+    return table.concat(parts, "\n\n")
+end
+
+-- One fresh question for a chapter page, written against everything the
+-- reader already has so it lands on a different moment.
+function Reflections:fetchOneChapterQuestion(chapter_title, old)
+    local node, next_node = Chapters.findNodeByTitle(self.ui, chapter_title)
+    if not node then
+        return nil, _("Could not find that chapter in this book.")
+    end
+    local kind = "previous"
+    local _, cur = Chapters.findChapter(self.ui, "current")
+    if cur and cur.title == chapter_title then kind = "current" end
+    local text = Chapters.getChapterText(self.ui, node, next_node, kind)
+    if not text or #text < 50 then
+        return nil, _("Could not extract enough chapter text.")
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildPrompt(info.title, info.author,
+        chapter_title, text, 1, old)
+    return Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+end
+
+function Reflections:fetchOneSessionQuestion(from_title, to_title, old)
+    local from_idx = Chapters.findIndexByTitle(self.ui, from_title)
+    local to_idx = Chapters.findIndexByTitle(self.ui, to_title)
+    if not from_idx or not to_idx then
+        return nil, _("Could not find those chapters in this book.")
+    end
+    if from_idx > to_idx then
+        from_idx, to_idx = to_idx, from_idx
+        from_title, to_title = to_title, from_title
+    end
+    local text = Chapters.getRangeText(self.ui, from_idx, to_idx)
+    if not text or #text < 50 then
+        return nil, _("Could not extract enough chapter text.")
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildSessionPrompt(info.title, info.author,
+        from_title, to_title, text, 1, old)
+    return Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+end
+
+function Reflections:fetchOnePageSessionQuestion(from_page, to_page, old)
+    local text = Chapters.getPageRangeText(self.ui, from_page, to_page)
+    if not text or #text < 50 then
+        return nil, _("Could not extract enough page text.")
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildSessionPrompt(info.title, info.author,
+        "page " .. from_page, "page " .. to_page, text, 1, old)
+    return Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+end
+
+function Reflections:fetchOneBookQuestion(old)
+    local text = Chapters.getWholeBookText(self.ui)
+    if not text or #text < 50 then
+        return nil, _("Could not extract enough text from this book.")
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildBookPrompt(info.title, info.author,
+        text, 1, old)
+    return Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+end
+
+-- Tapping a question asks whether to swap it for a new one.
+function Reflections:askSwapQuestion(idx)
+    local page = self._open_prompts
+    if not page or not page.canonical then return end
+    local questions = self:splitQuestions(page.canonical)
+    local q = questions[idx]
+    if not q then return end
+    local shown = q
+    if #shown > 240 then shown = shown:sub(1, 240) .. "…" end
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = _("Swap this question for a new one?\n\n") .. shown,
+        ok_text = _("Swap"),
+        ok_callback = function() self:swapQuestion(idx) end,
+        cancel_text = _("Cancel"),
+    })
+end
+
+-- Replace one question in the open set with a fresh one and save the set.
+-- Always a foreground request, like the Android generation paths: swap is
+-- a deliberate tap, so a short wait behind a busy note is fine.
+function Reflections:swapQuestion(idx)
+    local page = self._open_prompts
+    if not page or not page.canonical then return end
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local fetch = page.swap
+    if not fetch then
+        -- Chapter pages carry no fetcher; rebuild it from the title.
+        local title = page.title
+        if Chapters.findNodeByTitle(self.ui, title) then
+            fetch = function(old)
+                return self:fetchOneChapterQuestion(title, old)
+            end
+        end
+    end
+    if not fetch then
+        UIManager:show(InfoMessage:new{
+            text = _("Can't swap a question on this page."),
+        })
+        return
+    end
+    local questions = self:splitQuestions(page.canonical)
+    if idx < 1 or idx > #questions then return end
+
+    local busy = InfoMessage:new{ text = _("Generating a new question...") }
+    UIManager:show(busy)
+    UIManager:forceRePaint()
+    local result, err = fetch(page.canonical)
+    UIManager:close(busy)
+    if not result then
+        UIManager:show(InfoMessage:new{
+            text = _("Gemini request failed:\n") .. tostring(err),
+        })
+        return
+    end
+    local fresh = self:splitQuestions(result)
+    if #fresh == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("Gemini request failed:\nno usable question came back"),
+        })
+        return
+    end
+    questions[idx] = fresh[1]
+    local joined = self:joinQuestions(questions)
+    self:cachePrompts(page.cache_key, joined,
+        self:isPartialCache(page.cache_key))
+    self:showPrompts(page.title, joined, {
+        from_cache = false,
+        regen = page.regen,
+        swap = page.swap,
+        cache_key = page.cache_key,
+    })
+    -- The rebuilt page differs from the one it replaces in a single
+    -- block, and the incremental repaint that follows can leave the
+    -- old question ghosted under the new one on e-ink (field report:
+    -- the swapped question rendered smeared until the page was
+    -- reopened). Force one full repaint of the new page.
+    if self._open_prompts and self._open_prompts.dialog then
+        UIManager:setDirty(self._open_prompts.dialog, "full")
+    end
+end
+
+-- --------------------------------------- highlight aware questions
+
+-- Highlight annotations for this book, freshest source first: the live
+-- annotation module (highlights reach doc settings only when saved),
+-- then the persisted doc setting, then the legacy pre-annotation
+-- storage (bookmarks carry the text, the highlights table the style).
+function Reflections:readAnnotations()
+    local ann = self.ui and self.ui.annotation
+    if ann and type(ann.annotations) == "table" and #ann.annotations > 0 then
+        return ann.annotations
+    end
+    local saved = self:readDocSetting("annotations")
+    if type(saved) == "table" and #saved > 0 then return saved end
+    return self:readLegacyAnnotations()
+end
+
+function Reflections:readLegacyAnnotations()
+    local bookmarks = self:readDocSetting("bookmarks")
+    local highlights = self:readDocSetting("highlight")
+    if type(bookmarks) ~= "table" then return {} end
+    local out = {}
+    for _, bm in ipairs(bookmarks) do
+        if bm.highlighted and type(bm.notes) == "string" and bm.notes ~= "" then
+            local drawer = "lighten"
+            local page_hl = type(highlights) == "table" and highlights[bm.page]
+            if type(page_hl) == "table" then
+                for _, hl in ipairs(page_hl) do
+                    if hl.pos0 == bm.pos0 and hl.pos1 == bm.pos1 then
+                        drawer = hl.drawer or drawer
+                        break
+                    end
+                end
+            end
+            table.insert(out, {
+                drawer = drawer,
+                text = bm.notes,
+                pos0 = bm.pos0,
+                pos1 = bm.pos1,
+                page = bm.page,
+            })
+        end
+    end
+    return out
+end
+
+-- The chapter boundaries a chapter/session scope covers. Page scopes
+-- don't need nodes; they match on page numbers directly.
+function Reflections:scopeRange(scope)
+    if scope.kind == "chapter" then
+        local node, next_node = Chapters.findNodeByTitle(self.ui, scope.title)
+        if not node then return nil end
+        return node, next_node
+    elseif scope.kind == "session" then
+        local from_node = Chapters.findNodeByTitle(self.ui, scope.from)
+        local _, after_to = Chapters.findNodeByTitle(self.ui, scope.to)
+        if not from_node then return nil end
+        return from_node, after_to
+    end
+    return nil
+end
+
+-- True when an annotation is a highlight (not a bare bookmark) that
+-- belongs to the scope. Highlights can only exist where the reader has
+-- read, so this is spoiler safe by construction. Membership is decided
+-- by ANY positive signal (KOReader's own chapter tag, the page range,
+-- or the xpointer range): on real books each source can be missing or
+-- subtly off on a given build, and a cascade of vetoes matched nothing
+-- at all on a book full of highlights (field report, v48).
+function Reflections:annotationInScope(ann, scope, start_node, end_node,
+        ctx)
+    if ann.drawer == nil then return false end
+    if type(ann.text) ~= "string" or ann.text == "" then return false end
+    local doc = self.ui and self.ui.document
+    local pos = ann.pos0
+    -- The annotation's page without touching the document's page map
+    -- (resolving an xpointer to a page can force layout on real
+    -- documents, so that is a last resort, done once at the bottom).
+    local function ann_page_simple()
+        return tonumber(ann.pageno) or tonumber(ann.page)
+    end
+    local function ann_page_resolved()
+        local p = ann_page_simple()
+        if not p and type(pos) == "string" and doc
+            and doc.getPageFromXPointer then
+            local okp, pp = pcall(function()
+                return doc:getPageFromXPointer(pos)
+            end)
+            if okp then p = tonumber(pp) end
+        end
+        return p
+    end
+    if scope.kind == "pages" then
+        local p = ann_page_resolved()
+        return p ~= nil and p >= scope.from and p <= scope.to
+    end
+    -- The chapter title KOReader recorded on the annotation. For
+    -- sessions, collectHighlights precomputes the in-range title set:
+    -- resolving chapter indexes per annotation rebuilds the whole TOC
+    -- three times per highlight and froze the reader on real books.
+    if scope.kind == "chapter" and ann.chapter == scope.title then
+        return true
+    end
+    if scope.kind == "session" and ctx and ctx.titles
+        and ann.chapter and ctx.titles[ann.chapter] then
+        return true
+    end
+    if not start_node then return false end
+    -- Page numbers already on the annotation (no document work).
+    local p = ann_page_simple()
+    if p and start_node.page then
+        if p >= start_node.page
+            and (not end_node or not end_node.page
+                or p < end_node.page) then
+            return true
+        end
+    end
+    -- XPointer range against the chapter boundaries (pure data
+    -- comparison in the document engine).
+    if type(pos) == "string" and start_node.xpointer and doc
+        and type(doc.compareXPointers) == "function" then
+        local okc, ge = pcall(doc.compareXPointers, doc,
+            pos, start_node.xpointer)
+        if okc and ge >= 0 then
+            if not end_node then return true end
+            local okc2, lt = pcall(doc.compareXPointers, doc,
+                pos, end_node.xpointer)
+            if okc2 and lt < 0 then return true end
+        end
+    end
+    -- Last resort: resolve the xpointer to a page (can force layout).
+    p = ann_page_resolved()
+    if p and start_node.page then
+        if p >= start_node.page
+            and (not end_node or not end_node.page
+                or p < end_node.page) then
+            return true
+        end
+    end
+    return false
+end
+
+local HL_MAX_PASSAGES = 12
+local HL_MAX_CHARS = 8000
+
+-- Highlight passages inside a scope, in reading order, evenly thinned
+-- when there are more than the cap. Returns { text, chapter } entries.
+function Reflections:collectHighlights(scope)
+    local start_node, end_node
+    local ctx = {}
+    if scope.kind ~= "pages" then
+        -- Nodes may be missing (an odd TOC); chapter title matching in
+        -- annotationInScope can still find the scope's highlights.
+        start_node, end_node = self:scopeRange(scope)
+        if scope.kind == "session" then
+            -- In-range chapter titles, computed ONCE. Resolving the
+            -- indexes per annotation rebuilds the TOC three times per
+            -- highlight and froze the reader on real books (v50 report).
+            local list = Chapters.getChapterList(self.ui)
+            local fi = Chapters.findIndexByTitle(self.ui, scope.from)
+            local ti = Chapters.findIndexByTitle(self.ui, scope.to)
+            ctx.titles = {}
+            if fi and ti then
+                if fi > ti then fi, ti = ti, fi end
+                for i = fi, ti do
+                    if list[i] then ctx.titles[list[i].title] = true end
+                end
+            end
+        end
+    end
+    local anns = self:readAnnotations()
+    local out, seen = {}, {}
+    for _, ann in ipairs(anns) do
+        if self:annotationInScope(ann, scope, start_node, end_node, ctx) then
+            local dedupe = tostring(ann.pos0) .. "\n" .. ann.text
+            if not seen[dedupe] then
+                seen[dedupe] = true
+                table.insert(out, { text = ann.text, chapter = ann.chapter })
+            end
+        end
+    end
+    if #out > HL_MAX_PASSAGES then
+        local thinned = {}
+        local step = #out / HL_MAX_PASSAGES
+        for i = 0, HL_MAX_PASSAGES - 1 do
+            thinned[#thinned + 1] = out[math.floor(i * step) + 1]
+        end
+        out = thinned
+    end
+    local total, kept = 0, {}
+    for _, p in ipairs(out) do
+        total = total + #p.text
+        if total > HL_MAX_CHARS and #kept > 0 then break end
+        kept[#kept + 1] = p
+    end
+    return kept
+end
+
+function Reflections:countHighlights(scope)
+    return #self:collectHighlights(scope)
+end
+
+-- Highlights anywhere in the book, regardless of scope: distinguishes
+-- "nothing to read" from "read fine, none matched this chapter".
+function Reflections:countBookHighlights()
+    local n = 0
+    for _, ann in ipairs(self:readAnnotations()) do
+        if ann.drawer ~= nil and type(ann.text) == "string"
+            and ann.text ~= "" then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+function Reflections:highlightTarget(scope)
+    if scope.kind == "pages" then
+        local base = "Pages " .. scope.from .. "-" .. scope.to
+        return base, base .. "::highlights", "Highlights: " .. base
+    end
+    if scope.kind == "session" then
+        local base = self:getSessionKey(scope.from, scope.to)
+        return base, base .. "::highlights", "Highlights: " .. base
+    end
+    return scope.title, scope.title .. "::highlights",
+        "Highlights: " .. scope.title
+end
+
+function Reflections:highlightScopeLabel(scope)
+    if scope.kind == "pages" then
+        return "pages " .. scope.from .. " to " .. scope.to
+    end
+    if scope.kind == "session" then
+        return "the chapters \"" .. scope.from .. "\" to \"" .. scope.to .. "\""
+    end
+    return "the chapter \"" .. scope.title .. "\""
+end
+
+-- Questions grounded in the passages the reader chose to highlight.
+function Reflections:buildHighlightPrompt(title, author, scope_label,
+    passages, n, old)
+    local blocks = {}
+    for i, p in ipairs(passages) do
+        local label = "Passage " .. i
+        if type(p.chapter) == "string" and p.chapter ~= "" then
+            label = label .. " (from \"" .. p.chapter .. "\")"
+        end
+        blocks[#blocks + 1] = label .. ":\n\"" .. p.text .. "\""
+    end
+    local passage_text = table.concat(blocks, "\n\n")
+    local rules
+    if self:isNonfiction() then
+        rules = "Rules:\n"
+            .. "- Anchor every question in one or more passages: the "
+            .. "argument, evidence, concept, or claim in it\n"
+            .. "- Ask what the passage reveals about the author's thinking, "
+            .. "what it connects to, and what to question or challenge in it\n"
+            .. "- Specific to these passages and the book's ideas, never "
+            .. "generic\n"
+            .. "- Open-ended: no yes/no questions, no single correct answer\n"
+            .. "- Never ask about the reader's own life, feelings, or "
+            .. "experiences\n"
+            .. "- Do not summarize the passages\n"
+            .. "- Do not reveal or hint at anything not in the passages above\n"
+    else
+        rules = "Rules:\n"
+            .. "- Anchor every question in one or more passages: the moment, "
+            .. "choice, image, or line in it\n"
+            .. "- Ask what the passage sets up, echoes, or complicates within "
+            .. "the story so far; what question the passage itself raises\n"
+            .. "- Specific to these passages, never generic\n"
+            .. "- Open-ended: no yes/no questions, no single correct answer\n"
+            .. "- Never ask about the reader's own life, feelings, or "
+            .. "experiences\n"
+            .. "- Do not summarize the passages\n"
+            .. "- Do not reveal or hint at anything not in the passages above\n"
+    end
+    local intro
+    if self:isNonfiction() then
+        intro = "You are a reading companion helping someone think deeply "
+            .. "about the nonfiction book they just read. These are passages "
+            .. "they chose to highlight while reading; they will answer with "
+            .. "pen and paper in a physical journal, so make each question "
+            .. "open-ended and worth writing about.\n\n"
+    else
+        intro = "You are a reading companion helping someone think deeply "
+            .. "about the story they just read. These are passages they chose "
+            .. "to highlight while reading; they will answer with pen and "
+            .. "paper in a physical journal, so make each question "
+            .. "open-ended and worth writing about.\n\n"
+    end
+    return intro
+        .. "Book: \"" .. title .. "\" by " .. author .. "\n\n"
+        .. "Passages the reader highlighted in " .. scope_label
+        .. " (in reading order):\n---\n" .. passage_text .. "\n---\n\n"
+        .. "Write exactly " .. tostring(n) .. " numbered discussion "
+        .. "questions grounded in these passages. " .. rules
+        .. CRAFT_RULES
+        .. "- Output ONLY the numbered questions, nothing else"
+        .. avoidRepeat(old)
+end
+
+function Reflections:fetchOneHighlightQuestion(scope, old)
+    local passages = self:collectHighlights(scope)
+    if #passages == 0 then
+        return nil, _("No highlights there anymore.")
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    local prompt = self:buildHighlightPrompt(info.title, info.author,
+        self:highlightScopeLabel(scope), passages, 1, old)
+    return Gemini.generate(self:getApiKey(), self:getModelChain(),
+        prompt, 45, 1)
+end
+
+function Reflections:generateForHighlightsSync(scope, hl_key, hl_title,
+    prompt, regen, swap, back_to)
+    local busy = InfoMessage:new{
+        text = _("Generating questions from your highlights...") }
+    UIManager:show(busy)
+    UIManager:forceRePaint()
+
+    local result, err = Gemini.generate(self:getApiKey(),
+        self:getModelChain(), prompt, 45, 1)
+    UIManager:close(busy)
+
+    if not result then
+        UIManager:show(InfoMessage:new{
+            text = _("Gemini request failed:\n") .. tostring(err),
+        })
+        return
+    end
+    self:cachePrompts(hl_key, result, false)
+    self:showPrompts(hl_title, result, { from_cache = false,
+        cache_key = hl_key, regen = regen, swap = swap,
+        back_to = back_to })
+end
+
+function Reflections:generateForHighlights(scope, force)
+    if self:getApiKey() == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set your Gemini API key first:\nReflections > Settings > Gemini API key"),
+        })
+        return
+    end
+    local _base, hl_key, hl_title = self:highlightTarget(scope)
+    local regen = function()
+        self:generateForHighlights(scope, true)
+    end
+    local swap = function(old)
+        return self:fetchOneHighlightQuestion(scope, old)
+    end
+    -- Back from the highlights page returns to the page it was opened
+    -- from, not the chapter browser.
+    local back_to
+    if scope.kind == "chapter" then
+        back_to = function()
+            self:generateForChapter(scope.title, false)
+        end
+    else
+        local base_key = _base
+        back_to = function()
+            local prompts = self:readCachedPrompts(base_key)
+            if prompts then
+                self:showSessionPrompts(base_key, scope.from, scope.to,
+                    prompts, { from_cache = true })
+            else
+                self:showMainScreen()
+            end
+        end
+    end
+    if not force then
+        local cached = self:readCachedPrompts(hl_key)
+        if cached then
+            -- Deferred out of the tap: opening the cached set swaps
+            -- the parent prompts page for a full questions page in
+            -- the middle of the Highlights button press, which can
+            -- wedge the device (field reports v50 to v53: the button
+            -- froze only when a set was already cached). Fresh
+            -- generation escapes it because its result page arrives
+            -- from the poll timer instead. Same page, same content,
+            -- shown once the press has finished.
+            UIManager:scheduleIn(0, function()
+                self:showPrompts(hl_title, cached, { from_cache = true,
+                    cache_key = hl_key, regen = regen, swap = swap,
+                    back_to = back_to })
+            end)
+            return
+        end
+    end
+    local passages = self:collectHighlights(scope)
+    if #passages == 0 then
+        local total = self:countBookHighlights()
+        local text
+        if total > 0 then
+            text = _("No highlights matched ")
+                .. self:highlightScopeLabel(scope)
+                .. _(". (This book has ") .. total
+                .. _(" highlights saved elsewhere.)")
+        else
+            text = _("No highlights in this book yet. Highlight passages "
+                .. "while you read and the Highlights button will use them.")
+        end
+        UIManager:show(InfoMessage:new{ text = text })
+        return
+    end
+    local info = Chapters.getBookInfo(self.ui)
+    -- Never ask for more questions than there are passages to ground
+    -- them: one highlighted paragraph earns one question.
+    local n = scope.kind == "chapter" and self:getPromptCount()
+        or self:getSessionPromptCount()
+    n = math.min(n, #passages)
+    local prompt = self:buildHighlightPrompt(info.title, info.author,
+        self:highlightScopeLabel(scope), passages, n,
+        force and self:readCachedPrompts(hl_key) or nil)
+
+    -- No fork support (Android never forks (unreliable there)):
+    -- synchronous fallback.
+    if not self:shouldFork() then
+        self:generateForHighlightsSync(scope, hl_key, hl_title, prompt,
+            regen, swap, back_to)
+        return
+    end
+
+    if force then
+        local old_job = self._inflight[hl_key]
+        if old_job then
+            self:stopJob(old_job)
+            self._inflight[hl_key] = nil
+        end
+    end
+
+    self:showPrompts(hl_title, _("Generating your prompts…"),
+        { placeholder = true, cache_key = hl_key, regen = regen,
+            swap = swap, back_to = back_to })
+    self._pending = {
+        title = hl_key,
+        page_title = hl_title,
+        old = self:readCachedPrompts(hl_key),
+        waited = 0,
+        regen = regen,
+        cache_key = hl_key,
+        swap = swap,
+        back_to = back_to,
+    }
+    self:spawnJob(hl_key, prompt, { overwrite = force })
+    self:pollPendingPrompts()
 end
 
 -- ---------------------------------------------------------------- simplify
@@ -2644,8 +3562,11 @@ function Reflections:showMainScreen()
 
     for _, entry in ipairs(self:getProgress()) do
         local title = entry.title
+        -- A dot for chapters with questions waiting: the cache check is
+        -- per title, so finished and current chapters both show it.
+        local done = self:readCachedPrompts(title) ~= nil
         table.insert(items, {
-            text = title,
+            text = (done and "● " or "") .. title,
             callback = function()
                 -- The chapter list closes; Back on the prompts page reopens it.
                 UIManager:close(menu)
@@ -2709,7 +3630,7 @@ function Reflections:getSubMenuItems()
             callback = function() self:showSessionsScreen() end,
         },
         {
-            text = _("End of book reflection…"),
+            text = _("End of book reflection"),
             callback = function() self:showBookPicker() end,
         },
         {

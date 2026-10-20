@@ -15,7 +15,18 @@ one.
   Settings. It pins itself to the top of the Tools menu.
 - **Chapter browser**: open Chapters to see every chapter you've read so far.
   Tap one to read its questions; hold one to generate a fresh set. It opens
-  on the last page, where you left off.
+  on the last page, where you left off. Chapters with saved questions wear
+  a small dot, and every questions page shows when its set was generated.
+- **Highlights questions**: tap Highlights on any chapter or session page
+  and get a set grounded only in the passages you highlighted there, one
+  question per passage at most. Your own marked moments, reflected back.
+- **Tap a question to swap it**: don't love one question in a set? Tap it
+  and it is replaced with a fresh one written against the rest, so it
+  lands somewhere new.
+- **Journaling Extras**: a row at the bottom of every questions page with
+  standbys for anything the questions missed: predictions with odds, who
+  changed most, a confusion log, what stuck, one small deliberate detail,
+  and a sentence for future you.
 - **Reading sessions**: begin a session when you start reading and end it
   when you stop. Questions generate quietly for exactly what you covered,
   and a small notification tells you when they're waiting in the Sessions
