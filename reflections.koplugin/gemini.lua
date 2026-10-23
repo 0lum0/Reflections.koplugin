@@ -109,9 +109,14 @@ function Gemini._request(api_key, model, prompt_text, timeout,
     local url = "https://generativelanguage.googleapis.com/v1beta/models/"
         .. model .. ":generateContent"
 
+    -- The answer cap must leave room for the thinking it pays for:
+    -- Gemini counts thinking tokens against maxOutputTokens, so an
+    -- explicit budget rides on top of the base answer budget (the
+    -- same fix the OpenAI path got when its caps were scaled by
+    -- reasoning level). No budget (Auto) keeps the historical cap.
     local gen_config = {
         temperature = 0.7,
-        maxOutputTokens = 1024,
+        maxOutputTokens = 1024 + (thinking_budget or 0),
     }
     if thinking_budget ~= nil then
         gen_config.thinkingConfig = { thinkingBudget = thinking_budget }

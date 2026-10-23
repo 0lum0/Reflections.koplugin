@@ -128,11 +128,8 @@ end
 
 function Chapters.findNodeByTitle(ui, title)
     local list = Chapters.getChapterList(ui)
-    for i, node in ipairs(list) do
-        if node.title == title then
-            return node, list[i + 1]
-        end
-    end
+    local i = Chapters.indexInList(list, title)
+    if i then return list[i], list[i + 1] end
     return nil
 end
 
@@ -182,6 +179,35 @@ local function fitBudget(text, max_bytes)
     return head .. "\n\n[...text omitted...]\n\n" .. tail
 end
 
+-- Normalize extracted text: single spaces, no blank-line runs, trimmed.
+local function cleanText(text)
+    text = text:gsub("\r", " ")
+    text = text:gsub("[ \t]+", " ")
+    text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
+    return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Page-by-page text for paged documents (PDF, DjVu, ...). cap bounds
+-- how many non-empty pages get collected, as a sanity limit.
+local function pagedRangeText(ui, start_p, end_p, cap)
+    if not ui.document.getPageText then return "" end
+    local parts = {}
+    for p = start_p, end_p do
+        local ok, t = pcall(function() return ui.document:getPageText(p) end)
+        if ok and t and t ~= "" then table.insert(parts, t) end
+        if #parts > cap then break end -- sanity cap
+    end
+    return table.concat(parts, "\n")
+end
+
+-- Index of a title in an already-flattened chapter list (nil when absent).
+function Chapters.indexInList(list, title)
+    for i, node in ipairs(list) do
+        if node.title == title then return i end
+    end
+    return nil
+end
+
 -- Text for an arbitrary page range, never past the reading position.
 -- Used by page-based sessions.
 function Chapters.getPageRangeText(ui, from_page, to_page, budget)
@@ -193,20 +219,10 @@ function Chapters.getPageRangeText(ui, from_page, to_page, budget)
     if ui.rolling then
         local t = reflowablePageRangeText(ui, from_page, to_page)
         if t then text = t end
-    elseif ui.document.getPageText then
-        local parts = {}
-        for p = from_page, to_page do
-            local ok, t = pcall(function() return ui.document:getPageText(p) end)
-            if ok and t and t ~= "" then table.insert(parts, t) end
-            if #parts > 200 then break end -- sanity cap
-        end
-        text = table.concat(parts, "\n")
+    else
+        text = pagedRangeText(ui, from_page, to_page, 200)
     end
-    text = text:gsub("\r", " ")
-    text = text:gsub("[ \t]+", " ")
-    text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
-    text = text:gsub("^%s+", ""):gsub("%s+$", "")
-    return fitBudget(text, budget or 60000)
+    return fitBudget(cleanText(text), budget or 60000)
 end
 
 function Chapters.getBookInfo(ui)
@@ -245,16 +261,8 @@ function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
         if is_reflowable then
             local t = reflowablePageRangeText(ui, start_p, end_p)
             if t then text = t end
-        elseif ui.document.getPageText then
-            local parts = {}
-            for p = start_p, end_p do
-                local ok, t = pcall(function()
-                    return ui.document:getPageText(p)
-                end)
-                if ok and t and t ~= "" then table.insert(parts, t) end
-                if #parts > 80 then break end
-            end
-            text = table.concat(parts, "\n")
+        else
+            text = pagedRangeText(ui, start_p, end_p, 80)
         end
     elseif is_reflowable then
         -- Page-range extraction: a chapter's pages run from its TOC start
@@ -306,31 +314,15 @@ function Chapters.getChapterText(ui, chapter, next_chapter, which, budget)
             end_p = (next_chapter and (tonumber(next_chapter.page) - 1)) or current_page
         end
         end_p = math.max(start_p, end_p)
-        if ui.document.getPageText then
-            local parts = {}
-            for p = start_p, end_p do
-                local ok, t = pcall(function() return ui.document:getPageText(p) end)
-                if ok and t and t ~= "" then table.insert(parts, t) end
-                if #parts > 80 then break end -- sanity cap
-            end
-            text = table.concat(parts, "\n")
-        end
+        text = pagedRangeText(ui, start_p, end_p, 80)
     end
 
-    text = text:gsub("\r", " ")
-    text = text:gsub("[ \t]+", " ")
-    text = text:gsub("\n[ \t]*\n[ \t]*\n+", "\n\n")
-    text = text:gsub("^%s+", ""):gsub("%s+$", "")
-    return fitBudget(text, budget or 500000)
+    return fitBudget(cleanText(text), budget or 500000)
 end
 
 -- Index of the chapter with this title in the flattened chapter list.
 function Chapters.findIndexByTitle(ui, title)
-    local list = Chapters.getChapterList(ui)
-    for i, node in ipairs(list) do
-        if node.title == title then return i end
-    end
-    return nil
+    return Chapters.indexInList(Chapters.getChapterList(ui), title)
 end
 
 -- Spoiler-safe text for a chapter range (a reading session): concatenates

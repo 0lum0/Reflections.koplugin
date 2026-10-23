@@ -454,37 +454,33 @@ function Reflections:keySetupMessage()
         .. _(" API key first:\nReflections > Settings > API key")
 end
 
-function Reflections:getPromptCount()
+-- Shared shape of the three question-count settings: device setting,
+-- then the preconfigured file value, then the default; anything
+-- outside 1..MAX falls back to the default.
+local function countSetting(self, setting, conf_key, default)
     local n
     if G_reader_settings then
-        n = G_reader_settings:readSetting("reflections_prompt_count")
+        n = G_reader_settings:readSetting(setting)
     end
-    if n == nil then n = self:getFileConfig().prompt_count end
-    n = tonumber(n) or DEFAULT_PROMPT_COUNT
-    if n < 1 or n > MAX_PROMPT_COUNT then n = DEFAULT_PROMPT_COUNT end
+    if n == nil then n = self:getFileConfig()[conf_key] end
+    n = tonumber(n) or default
+    if n < 1 or n > MAX_PROMPT_COUNT then n = default end
     return n
+end
+
+function Reflections:getPromptCount()
+    return countSetting(self, "reflections_prompt_count", "prompt_count",
+        DEFAULT_PROMPT_COUNT)
 end
 
 function Reflections:getSessionPromptCount()
-    local n
-    if G_reader_settings then
-        n = G_reader_settings:readSetting("reflections_session_prompt_count")
-    end
-    if n == nil then n = self:getFileConfig().session_prompt_count end
-    n = tonumber(n) or DEFAULT_SESSION_PROMPT_COUNT
-    if n < 1 or n > MAX_PROMPT_COUNT then n = DEFAULT_SESSION_PROMPT_COUNT end
-    return n
+    return countSetting(self, "reflections_session_prompt_count",
+        "session_prompt_count", DEFAULT_SESSION_PROMPT_COUNT)
 end
 
 function Reflections:getBookPromptCount()
-    local n
-    if G_reader_settings then
-        n = G_reader_settings:readSetting("reflections_book_prompt_count")
-    end
-    if n == nil then n = self:getFileConfig().book_prompt_count end
-    n = tonumber(n) or DEFAULT_BOOK_PROMPT_COUNT
-    if n < 1 or n > MAX_PROMPT_COUNT then n = DEFAULT_BOOK_PROMPT_COUNT end
-    return n
+    return countSetting(self, "reflections_book_prompt_count",
+        "book_prompt_count", DEFAULT_BOOK_PROMPT_COUNT)
 end
 
 -- Fiction or nonfiction framing for the questions. Per book: a novel and a
@@ -563,8 +559,7 @@ function Reflections:editApiKey()
                 {
                     text = _("Save"),
                     callback = function()
-                        local v = dialog:getInputText() or ""
-                        v = v:gsub("^%s+", ""):gsub("%s+$", "")
+                        local v = trimValue(dialog:getInputText())
                         if provider_id == "gemini" then
                             G_reader_settings:saveSetting(
                                 "reflections_gemini_key", v)
@@ -604,8 +599,7 @@ function Reflections:editModel()
                 {
                     text = _("Save"),
                     callback = function()
-                        local v = dialog:getInputText() or ""
-                        v = v:gsub("^%s+", ""):gsub("%s+$", "")
+                        local v = trimValue(dialog:getInputText())
                         if provider_id == "gemini" then
                             if v == "" then v = DEFAULT_MODEL end
                             G_reader_settings:saveSetting(
@@ -640,8 +634,7 @@ function Reflections:editBaseUrl()
                 {
                     text = _("Save"),
                     callback = function()
-                        local v = dialog:getInputText() or ""
-                        v = v:gsub("^%s+", ""):gsub("%s+$", "")
+                        local v = trimValue(dialog:getInputText())
                             :gsub("/+$", "")
                         G_reader_settings:saveSetting(
                             "reflections_custom_base_url", v)
@@ -799,10 +792,19 @@ function Reflections:isSessionsValid()
     return false
 end
 
-function Reflections:readCachedPrompts(chapter_title)
+-- The current book's prompts cache table, or nil when there is none
+-- (or it belongs to an older clear-all generation; isCacheValid
+-- deletes stale data as a side effect).
+function Reflections:getCacheTable()
     if not self:isCacheValid() then return nil end
     local cache = self:readDocSetting("reflections_cache")
     if type(cache) ~= "table" then return nil end
+    return cache
+end
+
+function Reflections:readCachedPrompts(chapter_title)
+    local cache = self:getCacheTable()
+    if not cache then return nil end
     local entry = cache[chapter_title]
     if type(entry) == "string" then return entry end
     if type(entry) == "table" then return entry.text end
@@ -810,9 +812,8 @@ function Reflections:readCachedPrompts(chapter_title)
 end
 
 function Reflections:isPartialCache(chapter_title)
-    if not self:isCacheValid() then return false end
-    local cache = self:readDocSetting("reflections_cache")
-    if type(cache) ~= "table" then return false end
+    local cache = self:getCacheTable()
+    if not cache then return false end
     local entry = cache[chapter_title]
     return type(entry) == "table" and entry.partial == true
 end
@@ -842,9 +843,8 @@ end
 -- stamps existed, and for sets adopted from orphaned result files,
 -- whose origin is genuinely unknown).
 function Reflections:readCachedProvider(key)
-    if not self:isCacheValid() then return nil end
-    local cache = self:readDocSetting("reflections_cache")
-    if type(cache) ~= "table" then return nil end
+    local cache = self:getCacheTable()
+    if not cache then return nil end
     local entry = cache[key]
     if type(entry) == "table" and type(entry.provider) == "string"
         and entry.provider ~= "" then
@@ -855,9 +855,8 @@ end
 
 -- When a set was generated (nil for sets cached before timestamps existed).
 function Reflections:readCachedAt(key)
-    if not self:isCacheValid() then return nil end
-    local cache = self:readDocSetting("reflections_cache")
-    if type(cache) ~= "table" then return nil end
+    local cache = self:getCacheTable()
+    if not cache then return nil end
     local entry = cache[key]
     if type(entry) == "table" and type(entry.at) == "number" then
         return entry.at
@@ -920,6 +919,10 @@ function Reflections:onCloseDocument()
     -- will be adopted as an orphan next time this book opens.
     self._pending = nil
     self._open_prompts = nil
+    -- The floating generation notice belongs to the closing book too:
+    -- leaving it set would suppress the notice in every later book
+    -- (showGenNotice refuses to open a second one).
+    self:closeGenNotice()
     pcall(function() self:reapBackgroundJobs() end)
 end
 
@@ -1313,15 +1316,6 @@ function Reflections:getBookKey()
     return tostring(key):gsub("[^%w]", "_"):sub(1, 60)
 end
 
--- Shared job launcher: extracts the spoiler-guarded chapter text here in
--- the parent, then fork()s a child that only does the HTTPS call (with
--- retries for transient errors) and writes the result to a temp file.
--- opts: { kind = "previous"|"current", partial = bool, overwrite = bool }.
--- Returns true when a job is now running (or already was).
--- Forks a child that runs only the HTTPS call (with retries for transient
--- errors) and writes the result to a temp file, which the parent picks up
--- later. key identifies the job: a chapter title or a session key.
--- Returns true when a job is now running (or already was).
 -- fork() children are unreliable on Android: they can wedge in the
 -- network stack, and a blocking waitpid() on the UI thread then freezes
 -- the whole reader on "Generating your prompts...". Android therefore
@@ -1357,6 +1351,10 @@ function Reflections:stopJob(job)
     -- Still alive: abandon it. init reaps the zombie when KOReader exits.
 end
 
+-- Forks a child that runs only the HTTPS call (with retries for
+-- transient errors) and writes the result to a temp file, which the
+-- parent picks up later. key identifies the job: a chapter title or
+-- a session key. Returns true when a job is now running (or already was).
 function Reflections:spawnJob(key, prompt_text, opts)
     opts = opts or {}
     if self._inflight[key] then return true end
@@ -1400,6 +1398,10 @@ function Reflections:spawnJob(key, prompt_text, opts)
     return true
 end
 
+-- Shared chapter job launcher: extracts the spoiler-guarded chapter
+-- text here in the parent, then hands off to spawnJob.
+-- opts: { kind = "previous"|"current", partial = bool, overwrite = bool }.
+-- Returns true when a job is now running (or already was).
 function Reflections:launchGeneration(chapter_title, node, next_node, opts)
     opts = opts or {}
     if self._inflight[chapter_title] then return true end
@@ -1521,7 +1523,7 @@ function Reflections:generateForChapter(chapter_title, force, opts)
         return
     end
     local kind = "previous"
-    local cur_idx, cur = Chapters.findChapter(self.ui, "current")
+    local _cur_idx, cur = Chapters.findChapter(self.ui, "current")
     if cur and cur.title == chapter_title then kind = "current" end
 
     -- No fork support (Android never forks (unreliable there)): synchronous fallback.
@@ -1964,7 +1966,9 @@ function Reflections:showSessionPicker()
                 end
                 if cached then
                     self:showSessionPrompts(sess.key, sess.from, sess.to,
-                        cached, { from_cache = true, regen = regen })
+                        cached, { from_cache = true, regen = regen,
+                            session_kind = sess.kind == "pages"
+                                and "pages" or "chapters" })
                 elseif sess.kind == "pages" then
                     self:generateForPageSession(sess.from, sess.to, false)
                 else
@@ -2031,7 +2035,9 @@ function Reflections:showSessionsScreen()
                 end
                 if cached then
                     self:showSessionPrompts(sess.key, sess.from, sess.to,
-                        cached, { from_cache = true, regen = regen })
+                        cached, { from_cache = true, regen = regen,
+                            session_kind = sess.kind == "pages"
+                                and "pages" or "chapters" })
                 elseif self._inflight[sess.key] then
                     UIManager:show(InfoMessage:new{
                         text = _("Still generating, check back in a moment."),
@@ -2382,7 +2388,8 @@ function Reflections:generateForSession(from_title, to_title, force)
         local cached = self:readCachedPrompts(key)
         if cached then
             self:showSessionPrompts(key, from_title, to_title, cached,
-                { from_cache = true, regen = regen })
+                { from_cache = true, regen = regen,
+                    session_kind = "chapters" })
             return
         end
     end
@@ -2404,7 +2411,8 @@ function Reflections:generateForSession(from_title, to_title, force)
     end
 
     self:showSessionPrompts(key, from_title, to_title,
-        _("Generating your prompts…"), { placeholder = true, regen = regen })
+        _("Generating your prompts…"),
+        { placeholder = true, regen = regen, session_kind = "chapters" })
     self._pending = {
         title = key,
         old = self:readCachedPrompts(key),
@@ -2416,7 +2424,8 @@ function Reflections:generateForSession(from_title, to_title, force)
     if not ok or not text or #text < 50 then
         self._pending = nil
         self:showSessionPrompts(key, from_title, to_title,
-            _("Could not extract enough chapter text."), { regen = regen })
+            _("Could not extract enough chapter text."),
+            { regen = regen, session_kind = "chapters" })
         return
     end
     local info = Chapters.getBookInfo(self.ui)
@@ -2454,7 +2463,8 @@ function Reflections:generateForPageSession(from_page, to_page, force)
         local cached = self:readCachedPrompts(key)
         if cached then
             self:showSessionPrompts(key, from_label, to_label, cached,
-                { from_cache = true, regen = regen })
+                { from_cache = true, regen = regen,
+                    session_kind = "pages" })
             return
         end
     end
@@ -2475,7 +2485,8 @@ function Reflections:generateForPageSession(from_page, to_page, force)
     end
 
     self:showSessionPrompts(key, from_label, to_label,
-        _("Generating your prompts…"), { placeholder = true, regen = regen })
+        _("Generating your prompts…"),
+        { placeholder = true, regen = regen, session_kind = "pages" })
     self._pending = {
         title = key,
         old = self:readCachedPrompts(key),
@@ -2488,7 +2499,8 @@ function Reflections:generateForPageSession(from_page, to_page, force)
     if not ok or not text or #text < 50 then
         self._pending = nil
         self:showSessionPrompts(key, from_label, to_label,
-            _("Could not extract enough page text."), { regen = regen })
+            _("Could not extract enough page text."),
+            { regen = regen, session_kind = "pages" })
         return
     end
     local info = Chapters.getBookInfo(self.ui)
@@ -2529,7 +2541,7 @@ function Reflections:generateForPageSessionSync(key, from_label, to_label,
     self:cachePrompts(key, result, false, self:getProviderLabel())
     self:recordSession(key, from_page, to_page, "pages")
     self:showSessionPrompts(key, from_label, to_label, result,
-        { from_cache = false, regen = regen })
+        { from_cache = false, regen = regen, session_kind = "pages" })
 end
 
 function Reflections:generateForSessionSync(key, from_title, to_title,
@@ -2561,26 +2573,57 @@ function Reflections:generateForSessionSync(key, from_title, to_title,
     self:cachePrompts(key, result, false, self:getProviderLabel())
     self:recordSession(key, from_title, to_title)
     self:showSessionPrompts(key, from_title, to_title, result,
-        { from_cache = false, regen = regen })
+        { from_cache = false, regen = regen, session_kind = "chapters" })
 end
 
 -- Prompts page for a session. Thin wrapper: the key doubles as the page
 -- title, and New prompts regenerates this exact range.
 function Reflections:showSessionPrompts(key, from_title, to_title, prompts, opt)
     if type(opt) ~= "table" then opt = { from_cache = opt } end
-    if not opt.regen then
-        opt.regen = function()
-            self:generateForSession(from_title, to_title, true)
+    -- Which kind of session this is must never be guessed from the
+    -- title text alone: some books number their chapters with bare
+    -- numerals ("1", "2", ...), and tonumber() on those titles turned
+    -- a chapter session for chapters 1 to 2 into a page session for
+    -- pages 1 to 2, so Highlights (and Swap) read the wrong range
+    -- (field report: Sunrise on the Reaping, 2026-10-23). Callers that
+    -- know the kind pass opt.session_kind. The fallback accepts only
+    -- shapes that cannot be chapter titles: "page N" labels from the
+    -- live page flow, raw number values (not strings) from the saved
+    -- sessions list, and the "Pages N-M" key page sessions use.
+    local function page_num(v)
+        if type(v) == "number" then return v end
+        return tonumber((tostring(v):match("^page (%d+)$")))
+    end
+    local f, t = page_num(from_title), page_num(to_title)
+    local is_pages
+    if opt.session_kind == "pages" then
+        is_pages = true
+        if not f then f = tonumber(from_title) end
+        if not t then t = tonumber(to_title) end
+    elseif opt.session_kind == "chapters" then
+        is_pages = false
+    elseif f and t then
+        is_pages = true
+    elseif type(key) == "string" then
+        local kf, kt = key:match("^Pages (%d+)%-(%d+)$")
+        if kf and kt then
+            is_pages, f, t = true, tonumber(kf), tonumber(kt)
         end
     end
-    -- Page sessions arrive as "page N" labels from the live flow and
-    -- as raw numbers from the saved sessions list.
-    local f = tonumber(from_title)
-        or tonumber((tostring(from_title):match("^page (%d+)$")))
-    local t = tonumber(to_title)
-        or tonumber((tostring(to_title):match("^page (%d+)$")))
+    if is_pages and not (f and t) then is_pages = false end
+    if not opt.regen then
+        if is_pages then
+            opt.regen = function()
+                self:generateForPageSession(f, t, true)
+            end
+        else
+            opt.regen = function()
+                self:generateForSession(from_title, to_title, true)
+            end
+        end
+    end
     if not opt.swap then
-        if f and t then
+        if is_pages then
             opt.swap = function(old)
                 return self:fetchOnePageSessionQuestion(f, t, old)
             end
@@ -2591,7 +2634,7 @@ function Reflections:showSessionPrompts(key, from_title, to_title, prompts, opt)
         end
     end
     if not opt.hl_scope then
-        if f and t then
+        if is_pages then
             opt.hl_scope = { kind = "pages", from = f, to = t }
         else
             opt.hl_scope = { kind = "session", from = from_title, to = to_title }
@@ -3055,7 +3098,7 @@ function Reflections:pollPendingPrompts()
                     text = _("Session prompts are taking too long. Check your connection and try again."),
                 })
             else
-                showIt(_(self:getProviderLabel() .. " is taking too long. Check your connection and try again."),
+                showIt(self:getProviderLabel() .. " is taking too long. Check your connection and try again.",
                     { is_error = true })
             end
             return
@@ -3111,7 +3154,6 @@ end
 -- Standbys for anything the generated questions did not prompt,
 -- behind the "Journaling Extras" row at the bottom of the page.
 function Reflections:showJournalingExtras()
-    local InfoMessage = require("ui/widget/infomessage")
     UIManager:show(InfoMessage:new{
         text = _("Journaling Extras\n\n"
             .. "A few standbys for anything the questions missed:\n\n"
@@ -3501,7 +3543,7 @@ function Reflections:fetchOneChapterQuestion(chapter_title, old)
         return nil, _("Could not find that chapter in this book.")
     end
     local kind = "previous"
-    local _, cur = Chapters.findChapter(self.ui, "current")
+    local _cur_idx, cur = Chapters.findChapter(self.ui, "current")
     if cur and cur.title == chapter_title then kind = "current" end
     local text = Chapters.getChapterText(self.ui, node, next_node, kind)
     if not text or #text < 50 then
@@ -3696,7 +3738,7 @@ function Reflections:scopeRange(scope)
         return node, next_node
     elseif scope.kind == "session" then
         local from_node = Chapters.findNodeByTitle(self.ui, scope.from)
-        local _, after_to = Chapters.findNodeByTitle(self.ui, scope.to)
+        local _from_node, after_to = Chapters.findNodeByTitle(self.ui, scope.to)
         if not from_node then return nil end
         return from_node, after_to
     end
@@ -3799,9 +3841,11 @@ function Reflections:collectHighlights(scope)
             -- In-range chapter titles, computed ONCE. Resolving the
             -- indexes per annotation rebuilds the TOC three times per
             -- highlight and froze the reader on real books (v50 report).
+            -- Scan the list already in hand: findIndexByTitle would
+            -- rebuild and reflatten the whole TOC for each lookup.
             local list = Chapters.getChapterList(self.ui)
-            local fi = Chapters.findIndexByTitle(self.ui, scope.from)
-            local ti = Chapters.findIndexByTitle(self.ui, scope.to)
+            local fi = Chapters.indexInList(list, scope.from)
+            local ti = Chapters.indexInList(list, scope.to)
             ctx.titles = {}
             if fi and ti then
                 if fi > ti then fi, ti = ti, fi end
@@ -4027,11 +4071,13 @@ function Reflections:generateForHighlights(scope, force)
         end
     else
         local base_key = _base
+        local back_kind = scope.kind == "pages" and "pages" or "chapters"
         back_to = function()
             local prompts = self:readCachedPrompts(base_key)
             if prompts then
                 self:showSessionPrompts(base_key, scope.from, scope.to,
-                    prompts, { from_cache = true })
+                    prompts, { from_cache = true,
+                        session_kind = back_kind })
             else
                 self:showMainScreen()
             end
@@ -4236,11 +4282,16 @@ function Reflections:showMainScreen()
     local menu
     local items = {}
 
+    -- One cache read for the whole list: the dot only needs to know
+    -- whether a usable entry exists for the title.
+    local cache = self:getCacheTable()
     for _, entry in ipairs(self:getProgress()) do
         local title = entry.title
-        -- A dot for chapters with questions waiting: the cache check is
-        -- per title, so finished and current chapters both show it.
-        local done = self:readCachedPrompts(title) ~= nil
+        -- A dot for chapters with questions waiting: finished and
+        -- current chapters both show it.
+        local hit = cache and cache[title]
+        local done = type(hit) == "string"
+            or (type(hit) == "table" and hit.text ~= nil)
         table.insert(items, {
             text = (done and "● " or "") .. title,
             callback = function()
