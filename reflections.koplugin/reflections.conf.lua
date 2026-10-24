@@ -76,6 +76,15 @@ return {
 
     -- Generate prompts silently in the background when you finish a
     -- chapter. Off by default: generation spends API quota, so it is
-    -- opt-in. Set to true (or use Settings) if you want it.
+    -- opt-in. Set to true (or use Settings) if you want it. (Legacy
+    -- switch: the Settings picker now offers "off", "beginning", and
+    -- "end" for when background generation runs, and true here means
+    -- "end". To preconfigure a mode instead, add a line like:
+    -- background_mode = "beginning")
     background = false,
+
+    -- For background "beginning" mode: how many pages into a chapter
+    -- its questions generate at. The whole chapter is sent, so the
+    -- questions are ready when you finish it. 1 to 30.
+    background_pages = 3,
 }

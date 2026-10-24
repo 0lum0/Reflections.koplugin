@@ -2,8 +2,9 @@
 -- Finish a chapter and Gemini has pen-and-paper reflection prompts waiting
 -- for you, plus session questions spanning the chapters you read and an
 -- end-of-book reflection when you finish. Chapters are detected as you read;
--- prompts generate in the background the moment you turn the page into a
--- new chapter.
+-- background prompts can generate at the beginning of a chapter (a few
+-- pages in, from the whole chapter, so they are ready at its end) or
+-- at its end, or stay off.
 -- Chapter tracking approach adapted from xray.koplugin (ultimatejimmy).
 
 local _ = require("gettext")
@@ -137,6 +138,24 @@ local function reasoningById(id)
     return REASONING_LEVELS[1]
 end
 
+-- Background generation modes: "off"; "beginning" (questions for the
+-- chapter being read, generated once the reader is some pages in, from
+-- the whole chapter, so they are ready when the chapter ends); "end"
+-- (questions for a chapter the moment it is finished, the original
+-- behavior). The pre-mode boolean setting maps onto this: on meant
+-- "end".
+local BACKGROUND_MODES = {
+    { id = "off", label = "Off" },
+    { id = "beginning", label = "Beginning of chapter" },
+    { id = "end", label = "End of chapter" },
+}
+local DEFAULT_BACKGROUND_PAGES = 3
+local MAX_BACKGROUND_PAGES = 30
+
+local function isBackgroundMode(v)
+    return v == "off" or v == "beginning" or v == "end"
+end
+
 local function trimValue(v)
     if type(v) ~= "string" then return "" end
     return v:gsub("^%s+", ""):gsub("%s+$", "")
@@ -230,6 +249,10 @@ function Reflections:migrateFileConfig()
     seed("reflections_book_prompt_count", tonumber(cfg.book_prompt_count))
     seed("reflections_model", cfg.model)
     seed("reflections_background", cfg.background)
+    if isBackgroundMode(cfg.background_mode) then
+        seed("reflections_background_mode", cfg.background_mode)
+    end
+    seed("reflections_background_pages", tonumber(cfg.background_pages))
     -- Provider pre-configuration: the active provider, plus each
     -- provider's key and model, seed exactly like everything else,
     -- so any provider can be set up from a computer before install.
@@ -529,15 +552,67 @@ function Reflections:getModelChain()
     return { self:getModel() }
 end
 
-function Reflections:getBackgroundEnabled()
+-- The pre-mode boolean setting: device setting first, then the
+-- conf seed. On meant background generation at the end of a chapter.
+function Reflections:getBackgroundLegacy()
     local v
     if G_reader_settings then
         v = G_reader_settings:readSetting("reflections_background")
     end
     if v == nil then v = self:getFileConfig().background end
+    if v == nil then return false end
+    return v and true or false
+end
+
+function Reflections:getBackgroundMode()
+    local v
+    if G_reader_settings then
+        v = G_reader_settings:readSetting("reflections_background_mode")
+    end
+    if isBackgroundMode(v) then return v end
+    local cfg_mode = self:getFileConfig().background_mode
+    if isBackgroundMode(cfg_mode) then return cfg_mode end
+    if self:getBackgroundLegacy() then return "end" end
+    return "off"
+end
+
+function Reflections:getBackgroundModeLabel()
+    local mode = self:getBackgroundMode()
+    for _i, m in ipairs(BACKGROUND_MODES) do
+        if m.id == mode then return _(m.label) end
+    end
+    return _("Off")
+end
+
+function Reflections:setBackgroundMode(mode)
+    if not isBackgroundMode(mode) then return end
+    if not G_reader_settings then return end
+    G_reader_settings:saveSetting("reflections_background_mode", mode)
+    -- Keep the legacy boolean in step for anything still reading it.
+    G_reader_settings:saveSetting("reflections_background", mode ~= "off")
+    if G_reader_settings.flush then G_reader_settings:flush() end
+end
+
+function Reflections:getBackgroundEnabled()
     -- Off by default: generation spends API quota (and, on paid
     -- providers, money) silently, so it is opt-in from Settings.
-    if v == nil then return false end
+    return self:getBackgroundMode() ~= "off"
+end
+
+-- How many pages into a chapter "beginning" mode waits before it
+-- generates that chapter's questions (the whole chapter, so they
+-- are ready at its end).
+function Reflections:getBackgroundPages()
+    local v
+    if G_reader_settings then
+        v = tonumber(G_reader_settings:readSetting(
+            "reflections_background_pages"))
+    end
+    if not v then v = tonumber(self:getFileConfig().background_pages) end
+    if not v then v = DEFAULT_BACKGROUND_PAGES end
+    v = math.floor(v)
+    if v < 1 then v = 1 end
+    if v > MAX_BACKGROUND_PAGES then v = MAX_BACKGROUND_PAGES end
     return v
 end
 
@@ -928,7 +1003,7 @@ end
 
 function Reflections:checkChapterTransition()
     if not self.ui or not self.ui.document then return end
-    local idx, chapter = Chapters.findChapter(self.ui, "current")
+    local idx, chapter, next_chapter = Chapters.findChapter(self.ui, "current")
     if not idx or not chapter then return end
 
     local last = self:getLastIdx()
@@ -943,11 +1018,7 @@ function Reflections:checkChapterTransition()
             end
         end
         self:saveDocSetting("reflections_chapters", progress)
-        self:setLastIdx(idx)
-        return
-    end
-
-    if idx > last then
+    elseif idx > last then
         local list = Chapters.getChapterList(self.ui)
         for i = last, idx - 1 do
             local node = list[i]
@@ -958,6 +1029,10 @@ function Reflections:checkChapterTransition()
         end
     end
     self:setLastIdx(idx)
+
+    -- "Beginning of chapter" background mode watches the chapter
+    -- being read, whichever way the reader arrived in it.
+    self:maybeBackgroundGenerateBeginning(chapter, next_chapter)
 end
 
 -- ------------------------------------------------------------- generation
@@ -1010,18 +1085,31 @@ local function avoidRepeat(old)
         .. "different moments entirely, from different angles."
 end
 
-function Reflections:buildPrompt(title, author, chapter_title, text, n, old)
+function Reflections:buildPrompt(title, author, chapter_title, text, n, old,
+    partial)
+    -- Position-scoped sets (the reader is partway through the chapter)
+    -- get their own framing: the text is only what has been read so
+    -- far, and the questions must stay inside it. Full chapter sets
+    -- keep the exact wording they have always had.
+    local scope_note = ""
+    local target = "THIS chapter"
+    if partial then
+        scope_note = "The reader is partway through this chapter: "
+            .. "the text below is only the part they have read so far, "
+            .. "up to their current page.\n"
+        target = "THIS PART of the chapter"
+    end
     if self:isNonfiction() then
         return "You are a reading companion helping someone think deeply "
             .. "about the nonfiction book they just read. They will answer "
             .. "with pen and paper in a physical journal, so make each "
             .. "question open-ended and worth writing about.\n\n"
             .. "Book: \"" .. title .. "\" by " .. author .. "\n"
-            .. "Chapter: \"" .. chapter_title .. "\"\n\n"
+            .. "Chapter: \"" .. chapter_title .. "\"\n" .. scope_note .. "\n"
             .. "Chapter text (may be excerpted; NEVER reference anything "
             .. "beyond this text):\n---\n" .. text .. "\n---\n\n"
             .. "Write exactly " .. tostring(n) .. " numbered discussion "
-            .. "questions about THIS chapter, the kind a thoughtful book "
+            .. "questions about " .. target .. ", the kind a thoughtful book "
             .. "club would ask. Rules:\n"
             .. "- About the ideas themselves: the author's arguments, evidence, key concepts, and real-world applications\n"
             .. "- Open-ended: no yes/no questions, no single correct answer\n"
@@ -1040,11 +1128,11 @@ function Reflections:buildPrompt(title, author, chapter_title, text, n, old)
         .. "a physical journal, so make each question open-ended and worth "
         .. "writing about.\n\n"
         .. "Book: \"" .. title .. "\" by " .. author .. "\n"
-        .. "Chapter: \"" .. chapter_title .. "\"\n\n"
+        .. "Chapter: \"" .. chapter_title .. "\"\n" .. scope_note .. "\n"
         .. "Chapter text (may be excerpted; NEVER reference anything beyond "
         .. "this text):\n---\n" .. text .. "\n---\n\n"
         .. "Write exactly " .. tostring(n) .. " numbered discussion questions "
-        .. "about THIS chapter, the kind a thoughtful book club would ask. "
+        .. "about " .. target .. ", the kind a thoughtful book club would ask. "
         .. "Rules:\n"
         .. "- About the story itself: its events, characters, choices, themes, and ideas\n"
         .. "- Open-ended: no yes/no questions, no single correct answer\n"
@@ -1411,17 +1499,19 @@ function Reflections:launchGeneration(chapter_title, node, next_node, opts)
     local info = Chapters.getBookInfo(self.ui)
     local prompt_text = self:buildPrompt(
         info.title, info.author, chapter_title, text, self:getPromptCount(),
-        opts.overwrite and self:readCachedPrompts(chapter_title) or nil)
+        opts.overwrite and self:readCachedPrompts(chapter_title) or nil,
+        opts.partial)
     return self:spawnJob(chapter_title, prompt_text, opts)
 end
 
--- Kick off a SILENT background generation for a just-finished chapter.
--- Nothing is ever shown on the reading screen: the text is extracted here
--- in the parent, then fork() runs only the HTTPS call in the child, which
--- writes the result to a temp file and exits. The parent picks results up
--- on later page turns (see reapBackgroundJobs).
+-- Kick off a SILENT background generation for a just-finished chapter
+-- ("end" background mode). Nothing is ever shown on the reading screen:
+-- the text is extracted here in the parent, then fork() runs only the
+-- HTTPS call in the child, which writes the result to a temp file and
+-- exits. The parent picks results up on later page turns (see
+-- reapBackgroundJobs).
 function Reflections:maybeBackgroundGenerate(chapter_title, node, next_node)
-    if not self:getBackgroundEnabled() then return end
+    if self:getBackgroundMode() ~= "end" then return end
     if not self:shouldFork() then return end -- no fork (or Android): falls back to tap-to-generate
     if self:getApiKey() == "" then return end
     if self._inflight[chapter_title] then return end
@@ -1429,6 +1519,57 @@ function Reflections:maybeBackgroundGenerate(chapter_title, node, next_node)
     if cached and not self:isPartialCache(chapter_title) then return end
     self:launchGeneration(chapter_title, node, next_node,
         { kind = "previous", partial = false, overwrite = false })
+end
+
+-- Chapters this book has already had a "beginning" generation for,
+-- tagged with the cache generation so Clear cached reflections
+-- (which bumps the generation) re-arms them.
+function Reflections:getBgBegun()
+    local begun = self:readDocSetting("reflections_bg_begun")
+    if type(begun) == "table"
+        and begun.gen == self:getCacheGeneration()
+        and type(begun.titles) == "table" then
+        return begun.titles
+    end
+    return {}
+end
+
+function Reflections:markBgBegun(chapter_title)
+    local titles = self:getBgBegun()
+    titles[chapter_title] = true
+    self:saveDocSetting("reflections_bg_begun", {
+        gen = self:getCacheGeneration(),
+        titles = titles,
+    })
+end
+
+-- "Beginning of chapter" background generation: once the reader is
+-- the configured number of pages into the chapter being read, quietly
+-- generate its questions from the WHOLE chapter, so the finished set
+-- is already waiting when the reader reaches the end of it. (The
+-- model sees the unread remainder; that is the point of the mode.
+-- Reflect on current position in chapter is the spoiler safe one.)
+-- Fires once per chapter per book: an attempt, landed or failed,
+-- never retries on its own. A partial set from a position reflection
+-- is upgraded to the full set; a full set is never clobbered.
+function Reflections:maybeBackgroundGenerateBeginning(node, next_node)
+    if self:getBackgroundMode() ~= "beginning" then return end
+    if not node or not node.title then return end
+    if not self:shouldFork() then return end
+    if self:getApiKey() == "" then return end
+    local chapter_title = node.title
+    if self._inflight[chapter_title] then return end
+    if self:readCachedPrompts(chapter_title)
+        and not self:isPartialCache(chapter_title) then return end
+    if self:getBgBegun()[chapter_title] then return end
+    local start_p = tonumber(node.page) or 1
+    local pages_in = Chapters.getCurrentPage(self.ui) - start_p + 1
+    if pages_in < self:getBackgroundPages() then return end
+    if self:launchGeneration(chapter_title, node, next_node,
+        { kind = "previous", partial = false,
+            overwrite = self:isPartialCache(chapter_title) }) then
+        self:markBgBegun(chapter_title)
+    end
 end
 
 -- Collect finished background jobs (non-blocking) and adopt any result
@@ -1525,10 +1666,14 @@ function Reflections:generateForChapter(chapter_title, force, opts)
     local kind = "previous"
     local _cur_idx, cur = Chapters.findChapter(self.ui, "current")
     if cur and cur.title == chapter_title then kind = "current" end
+    -- The chapter being read is only ever generated from the reader's
+    -- current position, so its sets are always partial: a generation
+    -- for the finished chapter replaces them later.
+    local partial = (opts.partial and true or false) or kind == "current"
 
     -- No fork support (Android never forks (unreliable there)): synchronous fallback.
     if not self:shouldFork() then
-        self:generateForChapterSync(chapter_title, node, next_node, kind, opts.partial)
+        self:generateForChapterSync(chapter_title, node, next_node, kind, partial)
         return
     end
 
@@ -1546,12 +1691,12 @@ function Reflections:generateForChapter(chapter_title, force, opts)
         { placeholder = true })
     self._pending = {
         title = chapter_title,
-        partial = opts.partial and true or false,
+        partial = partial,
         old = self:readCachedPrompts(chapter_title),
         waited = 0,
     }
     if not self:launchGeneration(chapter_title, node, next_node,
-        { kind = kind, partial = opts.partial, overwrite = force }) then
+        { kind = kind, partial = partial, overwrite = force }) then
         self._pending = nil
         self:showPrompts(chapter_title,
             _("Could not extract enough chapter text."), {})
@@ -1576,7 +1721,8 @@ function Reflections:generateForChapterSync(chapter_title, node, next_node, kind
     end
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildPrompt(
-        info.title, info.author, chapter_title, text, self:getPromptCount())
+        info.title, info.author, chapter_title, text, self:getPromptCount(),
+        nil, partial)
     local result, err = Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
     UIManager:close(busy)
 
@@ -2271,6 +2417,73 @@ function Reflections:showReasoningPicker()
     UIManager:show(menu)
 end
 
+function Reflections:showBackgroundModePicker()
+    local Menu = require("ui/widget/menu")
+    local menu
+    local items = {}
+    local current = self:getBackgroundMode()
+    for _i, m in ipairs(BACKGROUND_MODES) do
+        local entry_id, entry_label = m.id, m.label
+        items[#items + 1] = {
+            text = entry_label
+                .. (entry_id == current and _(" (current)") or ""),
+            callback = function()
+                UIManager:close(menu)
+                self:setBackgroundMode(entry_id)
+                self:showAISettingsScreen()
+            end,
+        }
+    end
+    menu = Menu:new{
+        title = _("Generate in background"),
+        item_table = items,
+        is_popout = false,
+        is_borderless = true,
+    }
+    UIManager:show(menu)
+end
+
+-- Numeric entry for the "beginning" trigger: how many pages into a
+-- chapter its questions generate at.
+function Reflections:editBackgroundPages()
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Pages into the chapter"),
+        input_hint = "1 to " .. tostring(MAX_BACKGROUND_PAGES),
+        input = tostring(self:getBackgroundPages()),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self:showAISettingsScreen()
+                    end,
+                },
+                {
+                    text = _("Save"),
+                    callback = function()
+                        local v = tonumber(trimValue(dialog:getInputText()))
+                        if v then
+                            G_reader_settings:saveSetting(
+                                "reflections_background_pages",
+                                math.max(1, math.min(MAX_BACKGROUND_PAGES,
+                                    math.floor(v))))
+                            if G_reader_settings.flush then
+                                G_reader_settings:flush()
+                            end
+                        end
+                        UIManager:close(dialog)
+                        self:showAISettingsScreen()
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
 -- The AI side of Settings, in its own submenu: provider, key, model,
 -- reasoning, and background generation.
 function Reflections:showAISettingsScreen()
@@ -2318,16 +2531,12 @@ function Reflections:showAISettingsScreen()
         },
         {
             text_func = function()
-                if self:getBackgroundEnabled() then
-                    return _("Generate in background: on")
-                end
-                return _("Generate in background: off")
+                return _("Generate in background: ")
+                    .. self:getBackgroundModeLabel()
             end,
             callback = function()
                 UIManager:close(menu)
-                G_reader_settings:saveSetting(
-                    "reflections_background", not self:getBackgroundEnabled())
-                self:showAISettingsScreen()
+                self:showBackgroundModePicker()
             end,
         },
         {
@@ -2345,6 +2554,21 @@ function Reflections:showAISettingsScreen()
                 return _("API base URL: ") .. u
             end,
             callback = function() self:editBaseUrl() end,
+        })
+    end
+    if self:getBackgroundMode() == "beginning" then
+        -- The trigger page only means anything in beginning mode;
+        -- it sits right above Close.
+        table.insert(items, #items, {
+            text_func = function()
+                return _("Background start: page ")
+                    .. tostring(self:getBackgroundPages())
+                    .. _(" of the chapter")
+            end,
+            callback = function()
+                UIManager:close(menu)
+                self:editBackgroundPages()
+            end,
         })
     end
     menu = Menu:new{
@@ -3125,8 +3349,9 @@ function Reflections:closePromptsPage()
     end
 end
 
--- On-demand prompts for the chapter currently being read. Spoiler-guarded:
--- only text up to the current page is sent.
+-- On-demand prompts for the reader's current position in the chapter
+-- being read. Spoiler-guarded: only text from the chapter up to the
+-- current page is sent.
 function Reflections:reflectCurrent()
     if self:getApiKey() == "" then
         UIManager:show(InfoMessage:new{
@@ -3551,7 +3776,7 @@ function Reflections:fetchOneChapterQuestion(chapter_title, old)
     end
     local info = Chapters.getBookInfo(self.ui)
     local prompt = self:buildPrompt(info.title, info.author,
-        chapter_title, text, 1, old)
+        chapter_title, text, 1, old, kind == "current")
     return Gemini.generateAny(self:getAIConfig(), prompt, REQUEST_TIMEOUT, 1)
 end
 
@@ -4307,7 +4532,7 @@ function Reflections:showMainScreen()
     end
 
     table.insert(items, {
-        text = _("Reflect on current chapter"),
+        text = _("Reflect on current position in chapter"),
         callback = function()
             UIManager:close(menu)
             self:reflectCurrent()

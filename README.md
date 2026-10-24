@@ -8,9 +8,10 @@ a book club for one.
 ## What it does
 
 - **Tracks your chapters** from the book's table of contents as you read.
-- **Can generate reflection prompts in the background**, silently, the moment
-  you reach a new chapter (opt in under Settings > AI). Nothing ever appears
-  on your reading screen.
+- **Can generate reflection prompts in the background**, silently, either a
+  few pages into a chapter (from the whole chapter, so the questions are
+  waiting when you finish it) or the moment you finish it (opt in under
+  Settings > AI). Nothing ever appears on your reading screen.
 - **A proper submenu**: `Tools > Reflections` opens Chapters, Sessions, End
   of book reflection, Begin/End reading session, Fiction/Nonfiction mode, and
   Settings. It pins itself to the top of the Tools menu.
@@ -130,7 +131,8 @@ AI options live in their own submenu, `Settings > AI`:
 | API key | Your key for the active provider; every provider keeps its own | (empty) |
 | Model | Any model id the active provider offers | per provider (Gemini: `gemini-3.5-flash-lite`) |
 | Reasoning | How much thinking a model may do before answering: Auto, Off, Low, Medium, High | Auto |
-| Generate in background | Make questions automatically as you read | off |
+| Generate in background | When questions are made automatically as you read: Beginning of chapter, End of chapter, or Off | Off |
+| Background start | Beginning mode only: which page of the chapter its questions generate at; the whole chapter is sent, so they are ready when you finish it | page 3 |
 
 | Setting | What it does | Default |
 |---|---|---|
